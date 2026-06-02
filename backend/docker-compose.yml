@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai_doc_extraction_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - API_ENV=production
+      - API_TITLE=AI Document Data Extraction API
+      - PORT=8000
+      - HOST=0.0.0.0
+      - STORAGE_DIR=/app/storage
+      - TEMP_DIR=/app/temp_uploads
+      - LOG_LEVEL=INFO
+      - LOG_FILE=/app/logs/app.log
+      - PRIMARY_OCR=paddleocr
+      - FALLBACK_OCR=tesseract
+    volumes:
+      - backend_storage:/app/storage
+      - backend_temp:/app/temp_uploads
+      - backend_logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: ai_doc_extraction_frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  backend_storage:
+  backend_temp:
+  backend_logs:
