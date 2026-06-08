@@ -1,39 +1,15 @@
-import React from 'react';
+import { BatchItemStatus, JobStatus } from '../types';
 
-interface StatusBadgeProps {
-  status: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
-}
-
-export const StatusBadge: React.FC<StatusBadgeProps> = ({ status }) => {
-  const styles = {
-    PENDING: {
-      bg: 'bg-indigo-50 dark:bg-indigo-950/30 text-indigo-700 dark:text-indigo-400 border-indigo-200/50 dark:border-indigo-900/30',
-      label: 'Queued',
-      dot: 'bg-indigo-400'
-    },
-    PROCESSING: {
-      bg: 'bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 border-amber-200/50 dark:border-amber-900/30 animate-pulse',
-      label: 'Extracting',
-      dot: 'bg-amber-400 animate-ping'
-    },
-    COMPLETED: {
-      bg: 'bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border-emerald-200/50 dark:border-emerald-900/30',
-      label: 'Success',
-      dot: 'bg-emerald-400'
-    },
-    FAILED: {
-      bg: 'bg-rose-50 dark:bg-rose-950/30 text-rose-700 dark:text-rose-400 border-rose-200/50 dark:border-rose-900/30',
-      label: 'Failed',
-      dot: 'bg-rose-400'
-    }
+export function StatusBadge({ status }: { status: BatchItemStatus | JobStatus }) {
+  const styles: Record<string, string> = {
+    STAGED: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300',
+    UPLOADING: 'bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300',
+    UPLOADED: 'bg-indigo-50 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300',
+    QUEUED: 'bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300',
+    PROCESSING: 'bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300',
+    COMPLETED: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300',
+    FAILED: 'bg-rose-50 text-rose-700 dark:bg-rose-950 dark:text-rose-300',
+    CANCELLED: 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400',
   };
-
-  const currentStyle = styles[status] || styles.PENDING;
-
-  return (
-    <span className={`inline-flex items-center space-x-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border ${currentStyle.bg}`}>
-      <span className={`h-1.5 w-1.5 rounded-full ${currentStyle.dot}`} />
-      <span>{currentStyle.label}</span>
-    </span>
-  );
-};
+  return <span className={`inline-flex rounded-full px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-wider ${styles[status] ?? styles.STAGED}`}>{status}</span>;
+}

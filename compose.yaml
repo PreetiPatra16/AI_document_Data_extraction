@@ -1,0 +1,95 @@
+name: docuextract
+
+x-backend-environment: &backend-environment
+  API_ENV: production
+  STORAGE_DIR: /app/storage
+  TEMP_DIR: /app/temp_uploads
+  MODEL_DIR: /app/models
+  TROCR_MODEL_PATH: /app/models/trocr-handwritten
+  LOG_FILE: /app/logs/app.log
+  CORS_ORIGINS: http://localhost:3000
+  PADDLE_REQUIRED: "true"
+  TROCR_REQUIRED: "true"
+  PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "true"
+
+x-backend-volumes: &backend-volumes
+  - backend_storage:/app/storage
+  - backend_temp:/app/temp_uploads
+  - backend_logs:/app/logs
+  - ocr_models:/app/models
+
+services:
+  model-init:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python -m scripts.provision_models
+    environment:
+      <<: *backend-environment
+    volumes:
+      - ocr_models:/app/models
+    restart: "no"
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    init: true
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      <<: *backend-environment
+    volumes: *backend-volumes
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, urllib.request; data=json.load(urllib.request.urlopen('http://localhost:8000/api/v1/health/ready')); raise SystemExit(0 if data['status']=='ready' else 1)"
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 90s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    init: true
+    command: python -m app.core.workers.extraction_worker
+    environment:
+      <<: *backend-environment
+    volumes: *backend-volumes
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  backend_storage:
+  backend_temp:
+  backend_logs:
+  ocr_models:

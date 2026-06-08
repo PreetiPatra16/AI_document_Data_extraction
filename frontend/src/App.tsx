@@ -1,80 +1,45 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { Navbar } from './components/Navbar';
-import { Sidebar } from './components/Sidebar';
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { AppShell } from './components/AppShell';
 import { useDocumentStore } from './store/documentStore';
-import { apiService } from './services/api';
+import { Diagnostics } from './pages/Diagnostics';
+import { DocumentDetail } from './pages/DocumentDetail';
+import { History } from './pages/History';
+import { Workspace } from './pages/Workspace';
 
-// Pages
-import { Dashboard } from './pages/Dashboard';
-import { UploadWorkspace } from './pages/UploadWorkspace';
-import { ExtractionResults } from './pages/ExtractionResults';
-import { ProcessingLogs } from './pages/ProcessingLogs';
-import { Settings } from './pages/Settings';
+const queryClient = new QueryClient({
+  defaultOptions: { queries: { retry: 1, staleTime: 2_000 } },
+});
 
-const queryClient = new QueryClient();
+function Application() {
+  const initializeTheme = useDocumentStore((state) => state.initializeTheme);
+  const recoverItems = useDocumentStore((state) => state.recoverItems);
 
-const AppContent: React.FC = () => {
-  const [currentPage, setCurrentPage] = useState<string>('dashboard');
-  const { setDocuments, initializeTheme } = useDocumentStore();
-
-  // Load theme preference on boot
   useEffect(() => {
     initializeTheme();
-  }, [initializeTheme]);
-
-  // Periodically fetch documents list to update state dashboard metrics
-  useEffect(() => {
-    const fetchDocs = async () => {
-      try {
-        const docs = await apiService.listDocuments();
-        setDocuments(docs);
-      } catch (err) {
-        console.error("Failed to connect to Local Engine API:", err);
-      }
-    };
-
-    fetchDocs();
-    const interval = setInterval(fetchDocs, 4000);
-    return () => clearInterval(interval);
-  }, [setDocuments]);
-
-  const renderPage = () => {
-    switch (currentPage) {
-      case 'dashboard':
-        return <Dashboard setCurrentPage={setCurrentPage} />;
-      case 'upload':
-        return <UploadWorkspace setCurrentPage={setCurrentPage} />;
-      case 'results':
-        return <ExtractionResults />;
-      case 'logs':
-        return <ProcessingLogs />;
-      case 'settings':
-        return <Settings />;
-      default:
-        return <Dashboard setCurrentPage={setCurrentPage} />;
-    }
-  };
+    recoverItems();
+  }, [initializeTheme, recoverItems]);
 
   return (
-    <div className="flex flex-col min-h-screen bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-      <Navbar />
-      <div className="flex flex-1 overflow-hidden">
-        <Sidebar currentPage={currentPage} setCurrentPage={setCurrentPage} />
-        <main className="flex-1 overflow-y-auto p-8 max-w-7xl mx-auto w-full">
-          {renderPage()}
-        </main>
-      </div>
-    </div>
-  );
-};
-
-function App() {
-  return (
-    <QueryClientProvider client={queryClient}>
-      <AppContent />
-    </QueryClientProvider>
+    <Routes>
+      <Route element={<AppShell />}>
+        <Route path="/" element={<Workspace />} />
+        <Route path="/history" element={<History />} />
+        <Route path="/documents/:documentId" element={<DocumentDetail />} />
+        <Route path="/diagnostics" element={<Diagnostics />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Route>
+    </Routes>
   );
 }
 
-export default App;
+export default function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <Application />
+      </BrowserRouter>
+    </QueryClientProvider>
+  );
+}

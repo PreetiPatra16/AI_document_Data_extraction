@@ -1,203 +1,236 @@
 import os
-from typing import List, Dict, Any, Tuple
+from collections import defaultdict
+from pathlib import Path
+from time import monotonic
+from typing import Any, Dict, List, Optional
+
+from PIL import Image
 from loguru import logger
+
+from app.core.config import Settings, settings
 from app.middleware.error_handler import OCRException
 
-# Dynamic imports with graceful fallbacks
-PADDLE_AVAILABLE = False
-try:
-    from paddleocr import PaddleOCR
-    # Check if we can initialize it to be sure
-    PADDLE_AVAILABLE = True
-except Exception as e:
-    logger.warning(f"PaddleOCR library could not be imported: {str(e)}. Using fallback/mock.")
+settings.model_dir.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(settings.model_dir / "paddlex"))
 
-TESSERACT_AVAILABLE = False
 try:
     import pytesseract
-    # Configure path if specified
-    tess_path = os.getenv("TESSERACT_CMD", "tesseract")
-    pytesseract.pytesseract.tesseract_cmd = tess_path
-    # Quick version check to see if binary is available
+    pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_CMD", "tesseract")
     pytesseract.get_tesseract_version()
     TESSERACT_AVAILABLE = True
-except Exception as e:
-    logger.warning(f"Tesseract binary or pytesseract library is not available: {str(e)}. Using mock.")
+except Exception:
+    TESSERACT_AVAILABLE = False
+
+try:
+    from paddleocr import PaddleOCR
+    PADDLE_AVAILABLE = True
+except Exception:
+    PADDLE_AVAILABLE = False
+
 
 class OCRService:
-    def __init__(self):
-        self.primary_engine = os.getenv("PRIMARY_OCR", "paddleocr")
-        self.fallback_engine = os.getenv("FALLBACK_OCR", "tesseract")
-        
-        self.paddle_ocr = None
-        if PADDLE_AVAILABLE and self.primary_engine == "paddleocr":
+    def __init__(self, config: Settings = settings):
+        self.settings = config
+        self.initialization_errors: Dict[str, str] = {}
+        self.paddle = None
+        if PADDLE_AVAILABLE:
             try:
-                # Initialize PaddleOCR engine (use CPU by default)
-                self.paddle_ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
-                logger.info("PaddleOCR engine initialized successfully.")
-            except Exception as e:
-                logger.error(f"Failed to initialize PaddleOCR: {str(e)}")
-
-    async def perform_ocr(self, image_path: str, page_num: int = 1) -> List[Dict[str, Any]]:
-        """
-        Runs OCR on the given image.
-        Tries PaddleOCR first (for printed and mixed text).
-        If PaddleOCR fails or is unavailable, falls back to Tesseract.
-        If both are unavailable, generates mocked layout words for demonstration/testing.
-        
-        Returns a list of word blocks:
-        [
-            {
-                "text": "Extracted Text",
-                "confidence": 0.95,
-                "bounding_box": {"x": 10.0, "y": 20.0, "width": 100.0, "height": 30.0},
-                "page": 1
-            },
-            ...
-        ]
-        """
-        logger.info(f"Running OCR on image {image_path} (Page {page_num})")
-        
-        # 1. Primary Engine: PaddleOCR
-        if self.primary_engine == "paddleocr" and self.paddle_ocr:
+                self.paddle = PaddleOCR(
+                    text_detection_model_name=config.paddle_detection_model,
+                    text_recognition_model_name=config.paddle_recognition_model,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=True,
+                )
+            except Exception as exc:
+                self.initialization_errors["paddleocr"] = str(exc)
+                logger.exception("PaddleOCR initialization failed")
+                self.paddle = None
+        self.trocr = None
+        self.trocr_device = "cpu"
+        if config.trocr_model_path and Path(config.trocr_model_path).exists():
             try:
-                results = self._run_paddle_ocr(image_path, page_num)
-                if results:
-                    logger.info(f"PaddleOCR succeeded: detected {len(results)} elements on page {page_num}")
-                    return results
-            except Exception as e:
-                logger.warning(f"PaddleOCR failed: {str(e)}. Attempting Tesseract fallback.")
-        
-        # 2. Fallback Engine: Tesseract
-        if TESSERACT_AVAILABLE:
+                import torch
+                from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+
+                model = VisionEncoderDecoderModel.from_pretrained(config.trocr_model_path, local_files_only=True)
+                if torch.backends.mps.is_available():
+                    self.trocr_device = "mps"
+                    model = model.to(self.trocr_device)
+                self.trocr = (TrOCRProcessor.from_pretrained(config.trocr_model_path, local_files_only=True), model)
+            except Exception as exc:
+                self.initialization_errors["trocr"] = str(exc)
+                logger.exception("TrOCR initialization failed")
+                self.trocr = None
+
+    def capabilities(self) -> Dict[str, Any]:
+        return {
+            "paddleocr": bool(self.paddle),
+            "tesseract": TESSERACT_AVAILABLE,
+            "trocr": bool(self.trocr),
+            "trocr_device": self.trocr_device if self.trocr else None,
+            "initialization_errors": self.initialization_errors,
+        }
+
+    async def perform_ocr(self, image_path: str, page_num: int = 1, variant: str = "denoised") -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        paddle_error = None
+        if self.paddle:
+            started = monotonic()
             try:
-                results = self._run_tesseract_ocr(image_path, page_num)
-                if results:
-                    logger.info(f"Tesseract OCR succeeded: detected {len(results)} elements on page {page_num}")
-                    return results
-            except Exception as e:
-                logger.warning(f"Tesseract OCR failed: {str(e)}")
-                
-        # 3. Final Fallback: Mocked OCR results for local testing/dev when binaries aren't installed
-        logger.info(f"No active OCR engine available. Generating mock document contents for {os.path.basename(image_path)}")
-        return self._generate_mock_ocr_results(image_path, page_num)
-
-    def _run_paddle_ocr(self, image_path: str, page_num: int) -> List[Dict[str, Any]]:
-        if not self.paddle_ocr:
-            raise OCRException("PaddleOCR instance not initialized")
-            
-        result = self.paddle_ocr.ocr(image_path, cls=True)
-        if not result or not result[0]:
-            return []
-            
-        word_blocks = []
-        for line in result[0]:
-            box = line[0]  # List of 4 points: [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
-            text, confidence = line[1]
-            
-            # Convert 4 corner points to bounding box (x, y, w, h)
-            xs = [pt[0] for pt in box]
-            ys = [pt[1] for pt in box]
-            x = min(xs)
-            y = min(ys)
-            w = max(xs) - x
-            h = max(ys) - y
-            
-            word_blocks.append({
-                "text": text,
-                "confidence": float(confidence),
-                "bounding_box": {
-                    "x": float(x),
-                    "y": float(y),
-                    "width": float(w),
-                    "height": float(h)
-                },
-                "page": page_num
-            })
-            
-        return word_blocks
-
-    def _run_tesseract_ocr(self, image_path: str, page_num: int) -> List[Dict[str, Any]]:
-        # Run Tesseract with TSV/dictionary output to get words and coordinates
-        from PIL import Image
-        img = Image.open(image_path)
-        
-        # Get detailed word level data
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-        
-        word_blocks = []
-        n_boxes = len(data['text'])
-        for i in range(n_boxes):
-            # Only keep elements with actual text and confident predictions
-            text = data['text'][i].strip()
-            conf = float(data['conf'][i])
-            if text and conf > 0:
-                word_blocks.append({
-                    "text": text,
-                    "confidence": conf / 100.0,  # Tesseract returns 0-100
-                    "bounding_box": {
-                        "x": float(data['left'][i]),
-                        "y": float(data['top'][i]),
-                        "width": float(data['width'][i]),
-                        "height": float(data['height'][i])
-                    },
-                    "page": page_num
-                })
-        return word_blocks
-
-    def _generate_mock_ocr_results(self, image_path: str, page_num: int) -> List[Dict[str, Any]]:
-        """Generates static mock text blocks resembling typical form fields."""
-        filename = os.path.basename(image_path).lower()
-        
-        # We can tailor the mocks slightly depending on filename hints
-        if "invoice" in filename:
-            lines = [
-                ("INVOICE", 100, 50, 200, 40),
-                ("Invoice Number: INV-2026-004", 100, 120, 280, 20),
-                ("Date: May 27, 2026", 100, 150, 180, 20),
-                ("Bill To:", 100, 200, 80, 20),
-                ("John Doe Corp", 100, 225, 140, 20),
-                ("123 Main St, New York", 100, 250, 220, 20),
-                ("Total Amount: $1,250.00", 500, 450, 240, 25),
-                ("Tax Rate: 8.25%", 500, 480, 150, 20),
-                ("Grand Total: $1,353.12", 500, 510, 250, 30)
-            ]
-        elif "form" in filename or "application" in filename:
-            lines = [
-                ("APPLICATION FORM", 300, 50, 300, 35),
-                ("First Name:", 100, 150, 120, 20),
-                ("Preet", 250, 150, 80, 20),
-                ("Last Name:", 100, 190, 120, 20),
-                ("Sharma", 250, 190, 90, 20),
-                ("Email Address:", 100, 230, 140, 20),
-                ("preet.sharma@example.com", 250, 230, 260, 20),
-                ("Phone Number:", 100, 270, 130, 20),
-                ("+1 (555) 019-2834", 250, 270, 180, 20),
-                ("Signature:", 100, 350, 110, 20),
-                ("[Handwritten: Preet Sharma]", 250, 345, 200, 30)
-            ]
-        else:
-            lines = [
-                ("AI Document Extraction Engine", 150, 50, 400, 30),
-                ("Processed document page successfully.", 100, 120, 350, 20),
-                ("Key Features:", 100, 160, 130, 20),
-                ("- Fast OCR Processing", 120, 190, 200, 20),
-                ("- Template Matching", 120, 220, 200, 20),
-                ("- Multi-format parsing", 120, 250, 220, 20),
-                ("Sample Value: 99.8%", 100, 320, 180, 20)
-            ]
-            
-        results = []
-        for text, x, y, w, h in lines:
-            results.append({
-                "text": text,
-                "confidence": 0.98 if "handwritten" not in text.lower() else 0.72,
-                "bounding_box": {
-                    "x": float(x),
-                    "y": float(y),
-                    "width": float(w),
-                    "height": float(h)
-                },
-                "page": page_num
-            })
+                results = self._run_paddle(image_path, page_num, variant)
+                logger.info(
+                    "OCR engine=paddleocr page={} variant={} blocks={} duration_ms={:.2f}",
+                    page_num, variant, len(results), (monotonic() - started) * 1000,
+                )
+            except Exception as exc:
+                paddle_error = str(exc)
+                logger.exception("OCR engine=paddleocr failed page={} variant={}", page_num, variant)
+                results = []
+        if not results and TESSERACT_AVAILABLE:
+            started = monotonic()
+            try:
+                results = self._run_tesseract(image_path, page_num, variant)
+                logger.info(
+                    "OCR engine=tesseract page={} variant={} blocks={} duration_ms={:.2f} fallback_reason={}",
+                    page_num,
+                    variant,
+                    len(results),
+                    (monotonic() - started) * 1000,
+                    "paddle_failed" if paddle_error else "paddle_unavailable_or_empty",
+                )
+            except Exception as exc:
+                logger.exception("OCR engine=tesseract failed page={} variant={}", page_num, variant)
+                raise OCRException(
+                    "All configured OCR engines failed.",
+                    details={"page": page_num, "paddle_error": paddle_error, "tesseract_error": str(exc)},
+                ) from exc
+        if not results:
+            raise OCRException("No local OCR engine produced text.", details={"capabilities": self.capabilities()})
         return results
+
+    def _block(self, text: str, confidence: float, box: Dict[str, float], page: int, engine: str, variant: str):
+        return {
+            "text": text.strip(),
+            "confidence": round(max(0.0, min(1.0, confidence)), 4),
+            "bounding_box": box,
+            "polygon": [
+                [box["x"], box["y"]],
+                [box["x"] + box["width"], box["y"]],
+                [box["x"] + box["width"], box["y"] + box["height"]],
+                [box["x"], box["y"] + box["height"]],
+            ],
+            "page": page,
+            "source_engine": engine,
+            "image_variant": variant,
+        }
+
+    def _run_paddle(self, image_path: str, page: int, variant: str) -> List[Dict[str, Any]]:
+        raw = self.paddle.predict(image_path)
+        output = []
+        for result in raw or []:
+            data = result.json.get("res", result.json) if hasattr(result, "json") else result
+            texts = data.get("rec_texts", [])
+            scores = data.get("rec_scores", [])
+            polygons = data.get("rec_polys", data.get("dt_polys", []))
+            for text, confidence, polygon in zip(texts, scores, polygons):
+                points = polygon.tolist() if hasattr(polygon, "tolist") else polygon
+                xs, ys = [point[0] for point in points], [point[1] for point in points]
+                box = {"x": min(xs), "y": min(ys), "width": max(xs) - min(xs), "height": max(ys) - min(ys)}
+                output.append(self._block(text, float(confidence), box, page, "paddleocr", variant))
+        return output
+
+    def _run_tesseract(self, image_path: str, page: int, variant: str) -> List[Dict[str, Any]]:
+        data = pytesseract.image_to_data(Image.open(image_path), output_type=pytesseract.Output.DICT)
+        lines: Dict[tuple, List[int]] = defaultdict(list)
+        for index, text in enumerate(data["text"]):
+            if text.strip() and float(data["conf"][index]) > 0:
+                key = (data["block_num"][index], data["par_num"][index], data["line_num"][index])
+                lines[key].append(index)
+        output = []
+        for indexes in lines.values():
+            text = " ".join(data["text"][i].strip() for i in indexes)
+            left = min(data["left"][i] for i in indexes)
+            top = min(data["top"][i] for i in indexes)
+            right = max(data["left"][i] + data["width"][i] for i in indexes)
+            bottom = max(data["top"][i] + data["height"][i] for i in indexes)
+            confidence = sum(float(data["conf"][i]) for i in indexes) / len(indexes) / 100
+            box = {"x": float(left), "y": float(top), "width": float(right - left), "height": float(bottom - top)}
+            output.append(self._block(text, confidence, box, page, "tesseract", variant))
+        return output
+
+    async def perform_ocr_multi_variant(self, variants: Dict[str, str], page_num: int) -> List[Dict[str, Any]]:
+        """Run OCR on thresholded + denoised variants and merge, keeping the higher-confidence reading per region."""
+        all_blocks: List[Dict[str, Any]] = []
+        last_error: Optional[Exception] = None
+        for variant_name in ("thresholded", "denoised"):
+            path = variants.get(variant_name)
+            if not path:
+                continue
+            try:
+                blocks = await self.perform_ocr(path, page_num, variant=variant_name)
+                all_blocks.extend(blocks)
+            except OCRException as exc:
+                last_error = exc
+                logger.warning("OCR variant={} skipped page={} reason={}", variant_name, page_num, exc.message)
+        if not all_blocks:
+            if last_error:
+                raise last_error
+            raise OCRException("No variant produced OCR results.", details={"page": page_num})
+        return self._merge_blocks(all_blocks)
+
+    def _iou(self, a: Dict[str, float], b: Dict[str, float]) -> float:
+        ax1, ay1 = a["x"], a["y"]
+        ax2, ay2 = ax1 + a["width"], ay1 + a["height"]
+        bx1, by1 = b["x"], b["y"]
+        bx2, by2 = bx1 + b["width"], by1 + b["height"]
+        inter_w = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+        inter_h = max(0.0, min(ay2, by2) - max(ay1, by1))
+        inter = inter_w * inter_h
+        union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+        return inter / union if union > 0 else 0.0
+
+    def _merge_blocks(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        used: set = set()
+        for i, block in enumerate(blocks):
+            if i in used:
+                continue
+            best = block
+            for j in range(i + 1, len(blocks)):
+                if j in used or blocks[j]["page"] != block["page"]:
+                    continue
+                if self._iou(block["bounding_box"], blocks[j]["bounding_box"]) > 0.3:
+                    used.add(j)
+                    if blocks[j]["confidence"] > best["confidence"]:
+                        best = blocks[j]
+            merged.append(best)
+        return merged
+
+    def recognize_handwriting(self, image_path: str) -> Dict[str, Any]:
+        if not self.trocr:
+            raise OCRException("Local TrOCR model is unavailable.", details={"engine": "trocr"})
+        processor, model = self.trocr
+        pixels = processor(images=Image.open(image_path).convert("RGB"), return_tensors="pt").pixel_values.to(self.trocr_device)
+        generated = model.generate(pixels)
+        text = processor.batch_decode(generated, skip_special_tokens=True)[0]
+        return {"text": text, "confidence": 0.7, "source_engine": "trocr"}
+
+    def recognize_handwriting_region(self, image_path: str, bounding_box: Dict[str, float]) -> Dict[str, Any]:
+        """Crop a bounding box region from image_path and run TrOCR on it."""
+        if not self.trocr:
+            raise OCRException("Local TrOCR model is unavailable.", details={"engine": "trocr"})
+        img = Image.open(image_path).convert("RGB")
+        pad = 4
+        x1 = max(0, int(bounding_box["x"]) - pad)
+        y1 = max(0, int(bounding_box["y"]) - pad)
+        x2 = min(img.width, int(bounding_box["x"] + bounding_box["width"]) + pad)
+        y2 = min(img.height, int(bounding_box["y"] + bounding_box["height"]) + pad)
+        if x2 <= x1 or y2 <= y1:
+            raise OCRException("Bounding box produced an empty crop.", details={"bounding_box": bounding_box})
+        cropped = img.crop((x1, y1, x2, y2))
+        processor, model = self.trocr
+        pixels = processor(images=cropped, return_tensors="pt").pixel_values.to(self.trocr_device)
+        generated = model.generate(pixels)
+        text = processor.batch_decode(generated, skip_special_tokens=True)[0]
+        return {"text": text.strip(), "confidence": 0.7, "source_engine": "trocr"}

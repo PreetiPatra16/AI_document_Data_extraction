@@ -1,0 +1,6 @@
+# Install during image/model provisioning. Runtime must use locally cached model assets.
+paddleocr==3.6.0
+# 3.3.1 has no Linux ARM64 wheel, which breaks Docker Desktop on Apple Silicon.
+paddlepaddle==3.2.2
+transformers==4.57.1
+torch==2.8.0

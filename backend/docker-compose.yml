@@ -1,44 +1,52 @@
-version: '3.8'
-
 services:
-  backend:
+  api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: ai_doc_extraction_backend
+    init: true
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
+    env_file: .env
     environment:
-      - API_ENV=production
-      - API_TITLE=AI Document Data Extraction API
-      - PORT=8000
-      - HOST=0.0.0.0
-      - STORAGE_DIR=/app/storage
-      - TEMP_DIR=/app/temp_uploads
-      - LOG_LEVEL=INFO
-      - LOG_FILE=/app/logs/app.log
-      - PRIMARY_OCR=paddleocr
-      - FALLBACK_OCR=tesseract
+      STORAGE_DIR: /app/storage
+      TEMP_DIR: /app/temp_uploads
+      MODEL_DIR: /app/models
+      TROCR_MODEL_PATH: /app/models/trocr-handwritten
+      LOG_FILE: /app/logs/app.log
     volumes:
       - backend_storage:/app/storage
       - backend_temp:/app/temp_uploads
       - backend_logs:/app/logs
-    restart: unless-stopped
+      - ./models:/app/models:ro
+      - ./app:/app/app
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/ready')"]
       interval: 30s
       timeout: 10s
-      retries: 3
+      retries: 5
+      start_period: 180s
+    restart: unless-stopped
 
-  frontend:
+  worker:
     build:
-      context: ../frontend
+      context: .
       dockerfile: Dockerfile
-    container_name: ai_doc_extraction_frontend
-    ports:
-      - "3000:3000"
-    depends_on:
-      - backend
+    init: true
+    command: python -m app.core.workers.extraction_worker
+    env_file: .env
+    environment:
+      STORAGE_DIR: /app/storage
+      TEMP_DIR: /app/temp_uploads
+      MODEL_DIR: /app/models
+      TROCR_MODEL_PATH: /app/models/trocr-handwritten
+      LOG_FILE: /app/logs/app.log
+    volumes:
+      - backend_storage:/app/storage
+      - backend_temp:/app/temp_uploads
+      - backend_logs:/app/logs
+      - ./models:/app/models:ro
+      - ./app:/app/app
     restart: unless-stopped
 
 volumes:

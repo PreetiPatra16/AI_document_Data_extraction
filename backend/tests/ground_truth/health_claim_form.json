@@ -1,0 +1,17 @@
+{
+  "document_type": "health_claim_form",
+  "fields": {
+    "employee_name": {"value": "Pranita Vilas Ghule", "kind": "typed"},
+    "employee_email": {"value": "pranitag@techaim.in", "kind": "typed"},
+    "employee_mobile": {"value": "8976543210", "kind": "typed"},
+    "pan": {"value": "BGHYPL8907B", "kind": "typed"},
+    "patient_name": {"value": "Ram pimple", "kind": "typed"},
+    "residential_address": {"value": "city=Ahmadnagar, line_1=ghar na-30, nagar-kalyan road, line_2=vidya colony, nalegaon, postal_code=414001, state=Maharashtra", "kind": "typed"},
+    "diagnosis": {"value": "Currently not", "kind": "typed"},
+    "admission_date": {"value": "21/11/2025", "kind": "typed"},
+    "treating_doctor": {"value": "Dr Deshpande", "kind": "typed"},
+    "treating_doctor_mobile": {"value": "7675432190", "kind": "typed"},
+    "family_physician": {"value": "Dr. harpal singh", "kind": "typed"},
+    "family_physician_mobile": {"value": "7689898989", "kind": "typed"}
+  }
+}

@@ -1,130 +1,106 @@
 import os
+from pathlib import Path
+from typing import Any, Dict, List
+
 import cv2
 import numpy as np
-from PIL import Image
-from typing import List, Tuple
-from loguru import logger
+from pdf2image import convert_from_path
+
+from app.core.config import Settings, settings
 from app.middleware.error_handler import PreprocessingException
 
-# pdf2image might raise an exception if poppler is not installed, so handle it gracefully
-try:
-    from pdf2image import convert_from_path
-    PDF2IMAGE_AVAILABLE = True
-except ImportError:
-    PDF2IMAGE_AVAILABLE = False
-    logger.warning("pdf2image library not installed or poppler not available. PDF conversion will be mocked.")
 
 class PreprocessingService:
-    def __init__(self):
-        self.temp_dir = os.getenv("TEMP_DIR", "temp_uploads")
+    def __init__(self, config: Settings = settings):
+        self.settings = config
+        config.temp_dir.mkdir(parents=True, exist_ok=True)
 
-    async def preprocess_document(self, file_path: str) -> List[str]:
-        """
-        Ingests a PDF or image, converts pages to images, preprocesses them using OpenCV,
-        and saves preprocessed images for OCR. Returns a list of paths to preprocessed images.
-        """
-        logger.info(f"Starting preprocessing pipeline for file: {file_path}")
-        ext = os.path.splitext(file_path)[1].lower()
-        
-        page_images: List[Tuple[np.ndarray, int]] = []
-        
-        # 1. Image ingestion & PDF conversion
-        if ext == ".pdf":
-            page_images = await self._convert_pdf_to_images(file_path)
-        elif ext in [".png", ".jpg", ".jpeg", ".tiff", ".bmp"]:
-            img = cv2.imread(file_path)
-            if img is None:
-                raise PreprocessingException(f"Failed to read image at path: {file_path}")
-            page_images = [(img, 1)]
+    async def preprocess_document(self, file_path: str, document_id: str | None = None) -> List[Dict[str, Any]]:
+        source = Path(file_path)
+        doc_id = document_id or source.stem
+        pages: List[Dict[str, Any]] = []
+        if source.suffix.lower() == ".pdf":
+            page_number = 1
+            while True:
+                try:
+                    rendered = convert_from_path(
+                        str(source), first_page=page_number, last_page=page_number, fmt="png", thread_count=1
+                    )
+                except Exception as exc:
+                    raise PreprocessingException(f"Failed to render PDF page {page_number}.") from exc
+                if not rendered:
+                    break
+                image = cv2.cvtColor(np.array(rendered[0]), cv2.COLOR_RGB2BGR)
+                pages.append(self._create_variants(image, doc_id, page_number))
+                page_number += 1
         else:
-            raise PreprocessingException(f"Unsupported file format: {ext}")
-            
-        preprocessed_paths = []
-        
-        # 2. Core Image Preprocessing (CV)
-        for idx, (img, page_num) in enumerate(page_images):
-            try:
-                # Base operations: Grayscale, Denoising, Deskewing, Adaptive Thresholding
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                
-                # A. Denoise
-                denoised = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
-                
-                # B. Deskew
-                deskewed = self._deskew_image(denoised)
-                
-                # C. Adaptive Thresholding
-                thresholded = cv2.adaptiveThreshold(
-                    deskewed, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-                )
-                
-                # D. Morphological Operations (Optional, let's keep text crisp)
-                # We can perform a slight dilation/erosion if needed for handwritten lines, 
-                # but Adaptive Threshold is typically sufficient for primary PaddleOCR.
-                
-                # E. Save preprocessed image page
-                base_name = os.path.basename(file_path).split('.')[0]
-                target_path = os.path.join(self.temp_dir, f"preprocessed_{base_name}_page_{page_num}.png")
-                cv2.imwrite(target_path, thresholded)
-                
-                logger.info(f"Page {page_num} preprocessed and saved: {target_path}")
-                preprocessed_paths.append(target_path)
-            except Exception as e:
-                logger.error(f"Failed preprocessing page {page_num}: {str(e)}")
-                raise PreprocessingException(f"Failed to preprocess page {page_num}: {str(e)}")
-                
-        return preprocessed_paths
+            image = cv2.imread(str(source))
+            if image is None:
+                raise PreprocessingException("Failed to decode source image.")
+            pages.append(self._create_variants(image, doc_id, 1))
+        if not pages:
+            raise PreprocessingException("Document produced no renderable pages.")
+        return pages
 
-    async def _convert_pdf_to_images(self, pdf_path: str) -> List[Tuple[np.ndarray, int]]:
-        """Converts PDF pages to OpenCV matrices."""
-        if not PDF2IMAGE_AVAILABLE:
-            logger.warning("PDF conversion using pdf2image is unavailable (poppler missing). Mocking PDF pages.")
-            # Mock return a single blank white image
-            blank_img = np.ones((1100, 850, 3), dtype=np.uint8) * 255
-            return [(blank_img, 1)]
-            
-        try:
-            images = convert_from_path(pdf_path)
-            page_images = []
-            for i, img in enumerate(images):
-                # Convert PIL image to OpenCV format (BGR)
-                open_cv_image = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-                page_images.append((open_cv_image, i + 1))
-            return page_images
-        except Exception as e:
-            logger.error(f"Error during pdf2image conversion: {str(e)}")
-            # Fail gracefully with a descriptive error
-            raise PreprocessingException(f"Failed to convert PDF pages: {str(e)}")
+    def _create_variants(self, image: np.ndarray, document_id: str, page: int) -> Dict[str, Any]:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        oriented = self._orient(gray)
+        denoised = cv2.fastNlMeansDenoising(oriented, h=10, templateWindowSize=7, searchWindowSize=21)
+        deskewed = self._deskew(denoised)
+        thresholded = cv2.adaptiveThreshold(
+            deskewed, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 9
+        )
+        variants = {"original": image, "grayscale": gray, "denoised": deskewed, "thresholded": thresholded}
+        paths: Dict[str, str] = {}
+        for name, variant in variants.items():
+            path = self.settings.temp_dir / f"{document_id}_page_{page}_{name}.png"
+            if not cv2.imwrite(str(path), variant):
+                raise PreprocessingException(f"Failed to write {name} page variant.")
+            paths[name] = str(path)
+        laplacian = float(cv2.Laplacian(deskewed, cv2.CV_64F).var())
+        contrast = float(deskewed.std())
+        warnings = []
+        if laplacian < 50:
+            warnings.append("low_image_sharpness")
+        if contrast < 25:
+            warnings.append("low_image_contrast")
+        return {
+            "page": page,
+            "variants": paths,
+            "quality": {"sharpness": round(laplacian, 2), "contrast": round(contrast, 2)},
+            "warnings": warnings,
+        }
 
-    def _deskew_image(self, img: np.ndarray) -> np.ndarray:
-        """Calculates deskew angle and rotates image if necessary."""
+    def _orient(self, image: np.ndarray) -> np.ndarray:
         try:
-            # Threshold the image to make text stand out
-            _, thresh = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            
-            # Find coordinates of all white pixels (the text)
-            coords = np.column_stack(np.where(thresh > 0))
-            
-            # Get the minimum bounding box around all text pixels
-            angle = cv2.minAreaRect(coords)[-1]
-            
-            # Adjust angle depending on rotation orientation
-            if angle < -45:
-                angle = -(90 + angle)
-            else:
-                angle = -angle
-                
-            # If the angle is very small, do not rotate
-            if abs(angle) < 0.5 or abs(angle) > 20:
-                return img
-                
-            logger.info(f"Deskewing image by angle: {angle:.2f} degrees")
-            
-            (h, w) = img.shape[:2]
-            center = (w // 2, h // 2)
-            M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            rotated = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-            return rotated
-        except Exception as e:
-            logger.warning(f"Deskewing failed (skipping): {str(e)}")
-            return img
+            import pytesseract
+
+            osd = pytesseract.image_to_osd(image, output_type=pytesseract.Output.DICT)
+            rotation = int(osd.get("rotate", 0))
+            if rotation == 90:
+                return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+            if rotation == 180:
+                return cv2.rotate(image, cv2.ROTATE_180)
+            if rotation == 270:
+                return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        except Exception:
+            pass
+        return image
+
+    def _deskew(self, image: np.ndarray) -> np.ndarray:
+        try:
+            _, binary = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            coordinates = np.column_stack(np.where(binary > 0))
+            if len(coordinates) < 20:
+                return image
+            angle = cv2.minAreaRect(coordinates)[-1]
+            angle = -(90 + angle) if angle < -45 else -angle
+            if abs(angle) < 0.4 or abs(angle) > 15:
+                return image
+            height, width = image.shape[:2]
+            matrix = cv2.getRotationMatrix2D((width // 2, height // 2), angle, 1.0)
+            return cv2.warpAffine(
+                image, matrix, (width, height), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+            )
+        except Exception:
+            return image

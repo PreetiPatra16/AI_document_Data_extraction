@@ -1,66 +1,95 @@
 import { create } from 'zustand';
-import { Document } from '../types';
+import { BatchItem } from '../types';
 
-interface DocumentState {
-  documents: Document[];
-  activeDocument: Document | null;
+const STORAGE_KEY = 'docuextract-active-batch';
+
+interface AppState {
+  items: BatchItem[];
   darkMode: boolean;
-  
-  // Actions
-  setDocuments: (docs: Document[]) => void;
-  setActiveDocument: (doc: Document | null) => void;
-  addDocument: (doc: Document) => void;
-  updateDocumentInStore: (docId: string, updates: Partial<Document>) => void;
+  stageFiles: (files: File[]) => void;
+  removeItem: (localId: string) => void;
+  clearTerminalItems: () => void;
+  updateItem: (localId: string, updates: Partial<BatchItem>) => void;
+  recoverItems: () => void;
   toggleDarkMode: () => void;
   initializeTheme: () => void;
 }
 
-export const useDocumentStore = create<DocumentState>((set) => ({
-  documents: [],
-  activeDocument: null,
+function persist(items: BatchItem[]) {
+  const recoverable = items
+    .filter((item) => item.documentId)
+    .map((item) => ({
+      localId: item.localId,
+      filename: item.filename,
+      size: item.size,
+      mimeType: item.mimeType,
+      documentId: item.documentId,
+      jobId: item.jobId,
+      status: item.status,
+      stage: item.stage,
+      progress: item.progress,
+      previewLost: true,
+    }));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(recoverable));
+}
+
+export const useDocumentStore = create<AppState>((set) => ({
+  items: [],
   darkMode: false,
-
-  setDocuments: (documents) => set({ documents }),
-  setActiveDocument: (activeDocument) => set({ activeDocument }),
-  addDocument: (doc) => set((state) => ({ documents: [doc, ...state.documents] })),
-  
-  updateDocumentInStore: (docId, updates) => set((state) => {
-    const updatedDocs = state.documents.map((doc) => 
-      doc.id === docId ? { ...doc, ...updates } : doc
-    );
-    const updatedActive = state.activeDocument?.id === docId 
-      ? { ...state.activeDocument, ...updates } 
-      : state.activeDocument;
-      
-    return {
-      documents: updatedDocs,
-      activeDocument: updatedActive
-    };
+  stageFiles: (files) => set((state) => ({
+    items: [
+      ...state.items,
+      ...files.map((file) => ({
+        localId: crypto.randomUUID(),
+        filename: file.name,
+        size: file.size,
+        mimeType: file.type,
+        file,
+        previewUrl: URL.createObjectURL(file),
+        status: 'STAGED' as const,
+        progress: 0,
+      })),
+    ],
+  })),
+  removeItem: (localId) => set((state) => {
+    const target = state.items.find((item) => item.localId === localId);
+    if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl);
+    const items = state.items.filter((item) => item.localId !== localId);
+    persist(items);
+    return { items };
   }),
-
+  clearTerminalItems: () => set((state) => {
+    state.items
+      .filter((item) => ['COMPLETED', 'FAILED', 'CANCELLED'].includes(item.status))
+      .forEach((item) => item.previewUrl && URL.revokeObjectURL(item.previewUrl));
+    const items = state.items.filter((item) => !['COMPLETED', 'FAILED', 'CANCELLED'].includes(item.status));
+    persist(items);
+    return { items };
+  }),
+  updateItem: (localId, updates) => set((state) => {
+    const items = state.items.map((item) => item.localId === localId ? { ...item, ...updates } : item);
+    persist(items);
+    return { items };
+  }),
+  recoverItems: () => set((state) => {
+    if (state.items.length) return state;
+    try {
+      const items = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]') as BatchItem[];
+      return { items: items.map((item) => ({ ...item, previewLost: true })) };
+    } catch {
+      return { items: [] };
+    }
+  }),
   toggleDarkMode: () => set((state) => {
-    const newMode = !state.darkMode;
-    if (newMode) {
-      document.documentElement.classList.add('dark');
-      localStorage.setItem('theme', 'dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-      localStorage.setItem('theme', 'light');
-    }
-    return { darkMode: newMode };
+    const darkMode = !state.darkMode;
+    document.documentElement.classList.toggle('dark', darkMode);
+    localStorage.setItem('theme', darkMode ? 'dark' : 'light');
+    return { darkMode };
   }),
-
   initializeTheme: () => {
-    const savedTheme = localStorage.getItem('theme');
-    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    const isDark = savedTheme === 'dark' || (!savedTheme && prefersDark);
-    
-    if (isDark) {
-      document.documentElement.classList.add('dark');
-      set({ darkMode: true });
-    } else {
-      document.documentElement.classList.remove('dark');
-      set({ darkMode: false });
-    }
-  }
+    const saved = localStorage.getItem('theme');
+    const darkMode = saved === 'dark' || (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.classList.toggle('dark', darkMode);
+    set({ darkMode });
+  },
 }));

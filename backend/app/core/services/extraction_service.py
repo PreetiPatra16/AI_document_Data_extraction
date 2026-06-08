@@ -1,251 +1,400 @@
 import re
-from typing import List, Dict, Any, Tuple
+from difflib import SequenceMatcher
+from statistics import mean
+from typing import Any, Dict, List, Optional, Tuple
+
 from loguru import logger
-import math
+
+from app.core.config import Settings, settings
+from app.middleware.error_handler import ExtractionException
+
+
+SCHEMAS: Dict[str, Dict[str, Any]] = {
+    "health_claim_form": {
+        "anchors": ["claimant / patient details", "personal details of employee", "claim details"],
+        "fields": {
+            "employee_name": {"labels": ["name of the employee / individual", "name of employee / proposer"], "type": "name", "required": True},
+            "employee_email": {"labels": ["e-mail address of the employee/individual", "email address"], "type": "email"},
+            "employee_mobile": {"labels": ["mobile number"], "type": "phone"},
+            "pan": {"labels": ["permanent account number (pan)", "pan"], "type": "pan"},
+            "patient_name": {"labels": ["name of the patient", "claimant name"], "type": "name", "required": True},
+            "patient_date_of_birth": {"labels": ["date of birth of claimant"], "type": "date"},
+            "residential_address": {"labels": ["residential address"], "type": "address"},
+            "claimed_amount": {"labels": ["total claimed amount"], "type": "currency"},
+            "diagnosis": {"labels": ["diagnosis"], "type": "string"},
+            "admission_date": {"labels": ["admission date"], "type": "date"},
+            "discharge_date": {"labels": ["discharge date"], "type": "date"},
+            "treating_doctor": {"labels": ["name of treating doctor"], "type": "name"},
+            "treating_doctor_mobile": {"labels": ["mobile no. of treating doctor"], "type": "phone"},
+            "family_physician": {"labels": ["name of family physician"], "type": "name"},
+            "family_physician_mobile": {"labels": ["mobile no. of family physician"], "type": "phone"},
+        },
+    },
+    "health_proposal_form": {
+        "anchors": ["proposal form for health total", "proposer details", "details of persons to be insured"],
+        "fields": {
+            "proposer_name": {"labels": ["proposer details", "name"], "type": "name", "required": True},
+            "permanent_address": {"labels": ["permanent address and other details"], "type": "address"},
+            "state": {"labels": ["state"], "type": "string"},
+            "pin_code": {"labels": ["pin code"], "type": "pin"},
+            "mobile": {"labels": ["mobile no", "mobile no*"], "type": "phone"},
+            "email": {"labels": ["email id", "email"], "type": "email"},
+            "occupation": {"labels": ["occupation"], "type": "string"},
+        },
+    },
+    "motor_claim_form": {
+        "anchors": ["motor claim form", "claim form", "vehicle"],
+        "fields": {
+            "insured_name": {"labels": ["name of insured", "insured name"], "type": "name", "required": True},
+            "policy_number": {"labels": ["policy no", "policy number"], "type": "identifier"},
+            "claim_number": {"labels": ["claim no", "claim number"], "type": "identifier"},
+            "mobile": {"labels": ["mobile no", "mobile number"], "type": "phone"},
+            "email": {"labels": ["email", "e-mail"], "type": "email"},
+            "vehicle_registration": {"labels": ["registration no", "vehicle registration"], "type": "identifier"},
+        },
+    },
+}
+
 
 class ExtractionService:
-    def __init__(self):
-        # Definitions of v1 Form Templates
-        # Each template contains a dictionary of target fields, their matching labels, regex rules, and coordinates.
-        self.templates = {
-            "invoice": {
-                "name": "Standard Invoice Template",
-                "fields": {
-                    "invoice_number": {
-                        "labels": ["invoice number", "invoice #", "inv no", "inv #"],
-                        "regex": r"(?:inv|invoice)?[-#:\s]*([a-zA-Z0-9-]+)",
-                        "type": "string"
-                    },
-                    "date": {
-                        "labels": ["date", "invoice date", "dated"],
-                        "regex": r"(\b\d{1,2}[/\-\s]\d{1,2}[/\-\s]\d{2,4}\b|\b[a-zA-Z]{3,9}\s\d{1,2},\s\d{4}\b)",
-                        "type": "date"
-                    },
-                    "total_amount": {
-                        "labels": ["total amount", "grand total", "total due", "amount due", "total"],
-                        "regex": r"\$?\s*([\d,]+\.\d{2})",
-                        "type": "currency"
-                    },
-                    "tax_rate": {
-                        "labels": ["tax rate", "tax", "vat"],
-                        "regex": r"([\d\.]+)\s*%",
-                        "type": "percentage"
-                    }
-                }
-            },
-            "application_form": {
-                "name": "General Application Form",
-                "fields": {
-                    "first_name": {
-                        "labels": ["first name", "given name", "fname"],
-                        "regex": r"([a-zA-Z]+)",
-                        "type": "string"
-                    },
-                    "last_name": {
-                        "labels": ["last name", "surname", "lname"],
-                        "regex": r"([a-zA-Z]+)",
-                        "type": "string"
-                    },
-                    "email": {
-                        "labels": ["email address", "email", "e-mail"],
-                        "regex": r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)",
-                        "type": "email"
-                    },
-                    "phone": {
-                        "labels": ["phone number", "phone", "tel", "mobile"],
-                        "regex": r"((?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})",
-                        "type": "phone"
-                    },
-                    "signature": {
-                        "labels": ["signature", "signed by", "sign here"],
-                        "regex": r"\[?handwritten:\s*([^\]]+)\]?|([a-zA-Z\s]+)",
-                        "type": "signature"
-                    }
-                }
-            }
-        }
+    def __init__(self, config: Settings = settings):
+        self.settings = config
 
-    async def extract_data(self, ocr_results: List[Dict[str, Any]], filename: str) -> Dict[str, Any]:
-        """
-        Runs template-driven extraction matching labels, regex rules, and computing
-        custom confidence scores based on OCR score, regex match, and label-value distances.
-        """
-        logger.info(f"Starting field extraction for {filename} with {len(ocr_results)} OCR items.")
-        
-        # 1. Identify which template to use
-        template_key = self._classify_document(ocr_results, filename)
-        logger.info(f"Selected template: {template_key}")
-        
-        # Get selected template fields
-        template_def = self.templates.get(template_key)
-        if not template_def:
-            # Fallback to default raw output
-            return {
-                "document_type": "generic",
-                "fields": self._extract_generic_fields(ocr_results),
-                "confidence_summary": 0.85
-            }
-            
-        fields_config = template_def["fields"]
-        extracted_fields = {}
-        total_confidence = 0.0
-        field_count = 0
-        
-        # 2. Extract each field based on template specifications
-        for field_name, config in fields_config.items():
-            field_result = self._extract_field(ocr_results, config)
-            if field_result:
-                extracted_fields[field_name] = field_result
-                total_confidence += field_result["confidence"]
-                field_count += 1
+    async def extract_data(self, ocr_results: List[Dict[str, Any]], filename: str = "") -> Dict[str, Any]:
+        try:
+            clean_blocks = self._filter_noise_blocks(ocr_results)
+            document_type = self.classify(clean_blocks)
+            warnings: List[str] = []
+            paragraphs = self._assemble_free_text(clean_blocks)
+            raw_text = "\n\n".join(paragraphs)
+
+            if document_type == "free_text_document":
+                logger.info("Document classified as free_text_document paragraphs={}", len(paragraphs))
+                warnings.append("free_text_no_schema")
+                block_confidences = [b["confidence"] for b in clean_blocks if b["confidence"] > 0]
+                summary = round(mean(block_confidences), 4) if block_confidences else 0.0
+                return {
+                    "schema_version": "1.0",
+                    "document_type": document_type,
+                    "confidence_summary": summary,
+                    "review_required": True,
+                    "fields": {},
+                    "tables": [],
+                    "warnings": warnings,
+                    "raw_text": raw_text,
+                    "paragraphs": paragraphs,
+                }
+
+            schema = SCHEMAS.get(document_type)
+            if schema:
+                fields = {name: self._extract_field(clean_blocks, spec) for name, spec in schema["fields"].items()}
             else:
-                extracted_fields[field_name] = {
-                    "value": None,
-                    "confidence": 0.0,
-                    "bounding_box": None,
-                    "page": 1,
-                    "raw_text": None
-                }
-                
-        avg_confidence = total_confidence / field_count if field_count > 0 else 0.0
-        
-        return {
-            "document_type": template_key,
-            "fields": extracted_fields,
-            "confidence_summary": round(avg_confidence, 2)
-        }
-
-    def _classify_document(self, ocr_results: List[Dict[str, Any]], filename: str) -> str:
-        """Classifies document to a template using filename keywords and OCR keyword hits."""
-        name_lower = filename.lower()
-        if "invoice" in name_lower:
-            return "invoice"
-        if "form" in name_lower or "app" in name_lower:
-            return "application_form"
-            
-        # Analyze OCR text for keywords
-        ocr_text_pool = " ".join([item["text"].lower() for item in ocr_results])
-        
-        invoice_hits = sum(1 for kw in ["invoice", "tax invoice", "amount due", "bill to"] if kw in ocr_text_pool)
-        form_hits = sum(1 for kw in ["application", "first name", "email address", "signature"] if kw in ocr_text_pool)
-        
-        if invoice_hits > form_hits and invoice_hits > 0:
-            return "invoice"
-        elif form_hits > invoice_hits and form_hits > 0:
-            return "application_form"
-            
-        return "generic"
-
-    def _extract_field(self, ocr_results: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Attempts to extract a single field by locating its label in OCR space,
-        finding the nearest-neighbor / right-neighbor / bottom-neighbor value block,
-        applying validation regex, and computing robust confidence scores.
-        """
-        target_labels = config["labels"]
-        regex_pattern = config["regex"]
-        
-        best_candidate = None
-        
-        # Traverse OCR results to find labels
-        for idx, ocr_item in enumerate(ocr_results):
-            text = ocr_item["text"].lower().strip()
-            
-            # Check if this OCR block contains one of our target labels
-            matching_label = next((lbl for lbl in target_labels if lbl in text), None)
-            if not matching_label:
-                continue
-                
-            label_box = ocr_item["bounding_box"]
-            label_page = ocr_item["page"]
-            
-            # Now find a value candidate. Values are usually next to the label (same line/right) 
-            # or directly below it. We'll search OCR items on the same page.
-            candidates = []
-            for other_idx, other_item in enumerate(ocr_results):
-                if other_idx == idx or other_item["page"] != label_page:
-                    continue
-                    
-                other_box = other_item["bounding_box"]
-                
-                # Compute spatial relationship
-                dx = other_box["x"] - (label_box["x"] + label_box["width"])
-                dy = other_box["y"] - label_box["y"]
-                
-                # Candidate 1: Right neighbor (same horizontal band, distance not too far)
-                is_right = -15 < dy < 15 and 0 <= dx < 300
-                
-                # Candidate 2: Bottom neighbor (vertically aligned, down not too far)
-                is_bottom = -20 < (other_box["x"] - label_box["x"]) < 50 and 0 < (other_box["y"] - (label_box["y"] + label_box["height"])) < 60
-                
-                if is_right or is_bottom:
-                    candidates.append((other_item, dx, dy, "right" if is_right else "bottom"))
-                    
-            # Let's inspect the label block itself as sometimes the label and value are combined 
-            # (e.g. "Invoice Number: INV-001")
-            matches = re.search(regex_pattern, ocr_item["text"], re.IGNORECASE)
-            if matches:
-                matched_val = next((m for m in matches.groups() if m), ocr_item["text"])
-                ocr_conf = ocr_item["confidence"]
-                # Combined block gets high proximity score (distance = 0)
-                score = self._compute_confidence(ocr_conf, regex_match=1.0, distance_factor=1.0)
-                
-                candidate = {
-                    "value": matched_val.strip(": ").strip(),
-                    "confidence": score,
-                    "bounding_box": label_box,
-                    "page": label_page,
-                    "raw_text": ocr_item["text"]
-                }
-                if not best_candidate or score > best_candidate["confidence"]:
-                    best_candidate = candidate
-                    
-            # Check separate candidates
-            for cand_item, dx, dy, alignment in candidates:
-                cand_text = cand_item["text"]
-                matches = re.search(regex_pattern, cand_text, re.IGNORECASE)
-                if matches:
-                    matched_val = next((m for m in matches.groups() if m), cand_text)
-                    ocr_conf = cand_item["confidence"]
-                    
-                    # Compute spatial distance penalty
-                    distance = math.sqrt(dx**2 + dy**2) if alignment == "right" else dy
-                    distance_factor = max(0.1, 1.0 - (distance / 400.0))  # Closer is better
-                    
-                    score = self._compute_confidence(ocr_conf, regex_match=1.0, distance_factor=distance_factor)
-                    
-                    candidate = {
-                        "value": matched_val.strip(),
-                        "confidence": score,
-                        "bounding_box": cand_item["bounding_box"],
-                        "page": label_page,
-                        "raw_text": cand_text
-                    }
-                    if not best_candidate or score > best_candidate["confidence"]:
-                        best_candidate = candidate
-                        
-        return best_candidate
-
-    def _compute_confidence(self, ocr_confidence: float, regex_match: float, distance_factor: float) -> float:
-        """
-        Combines three dimensions:
-        - OCR Confidence (from model output)
-        - Regex match score (1.0 for matches, lower or None if invalid pattern)
-        - Distance Factor (relative location to label, 1.0 is perfect)
-        """
-        # Weighted average
-        score = (ocr_confidence * 0.4) + (regex_match * 0.3) + (distance_factor * 0.3)
-        return round(min(1.0, max(0.0, score)), 2)
-
-    def _extract_generic_fields(self, ocr_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Generic fallback when no template matches."""
-        # Return first 10 text blocks parsed directly as generic metadata key-values
-        generic_data = {}
-        for idx, item in enumerate(ocr_results[:10]):
-            generic_data[f"block_{idx+1}"] = {
-                "value": item["text"],
-                "confidence": item["confidence"],
-                "bounding_box": item["bounding_box"],
-                "page": item["page"]
+                fields = self._generic_fields(clean_blocks)
+                warnings.append("unsupported_template")
+            confidences = [field["confidence"] for field in fields.values() if field["value"] is not None]
+            summary = round(mean(confidences), 4) if confidences else 0.0
+            review = any(field["review_required"] for field in fields.values()) or not fields
+            if not confidences:
+                warnings.append("no_fields_extracted")
+                review = True
+            return {
+                "schema_version": "1.0",
+                "document_type": document_type,
+                "confidence_summary": summary,
+                "review_required": review,
+                "fields": fields,
+                "tables": [],
+                "warnings": warnings,
+                "raw_text": raw_text,
+                "paragraphs": paragraphs,
             }
-        return generic_data
+        except ExtractionException:
+            raise
+        except Exception as exc:
+            raise ExtractionException(f"Structured field extraction failed: {exc}") from exc
+
+    def classify(self, blocks: List[Dict[str, Any]]) -> str:
+        text = " ".join(block["text"].lower() for block in blocks)
+        tokens = set(text.split())
+        scores: Dict[str, float] = {}
+        for name, schema in SCHEMAS.items():
+            score = 0.0
+            for anchor in schema["anchors"]:
+                if anchor.lower() in text:
+                    score += 2.0
+                else:
+                    anchor_tokens = set(anchor.lower().split())
+                    if anchor_tokens:
+                        overlap = len(anchor_tokens & tokens) / len(anchor_tokens)
+                        if overlap >= 0.6:
+                            score += overlap
+                        else:
+                            ratio = SequenceMatcher(None, anchor.lower(), text).ratio()
+                            if ratio >= 0.7:
+                                score += ratio
+            scores[name] = score
+        winner = max(scores, key=scores.get)
+        if scores[winner] >= 0.6:
+            return winner
+        if self._is_free_text(blocks):
+            return "free_text_document"
+        return "generic_form"
+
+    def _is_free_text(self, blocks: List[Dict[str, Any]]) -> bool:
+        """Heuristic: if blocks look like running prose rather than label:value pairs."""
+        valid = [b for b in blocks if b["text"].strip()]
+        if len(valid) < 3:
+            return False
+        avg_len = sum(len(b["text"]) for b in valid) / len(valid)
+        colon_pct = sum(1 for b in valid if ":" in b["text"]) / len(valid)
+        long_block_pct = sum(1 for b in valid if len(b["text"].split()) >= 5) / len(valid)
+        return avg_len > 20 and colon_pct < 0.25 and long_block_pct > 0.4
+
+    def _extract_field(self, blocks: List[Dict[str, Any]], spec: Dict[str, Any]) -> Dict[str, Any]:
+        candidates: List[Tuple[str, Dict[str, Any], float, bool]] = []
+        for label_block in blocks:
+            label_text = label_block["text"].strip()
+            label_lower = label_text.lower()
+            for label in spec["labels"]:
+                position = label_lower.find(label.lower())
+                if position < 0:
+                    continue
+                remainder = re.sub(r"^[\s:.\-–]+", "", label_text[position + len(label):]).strip()
+                if remainder:
+                    candidates.append((remainder, label_block, 1.0, True))
+                label_box = label_block["bounding_box"]
+                for value_block in blocks:
+                    if value_block is label_block or value_block["page"] != label_block["page"]:
+                        continue
+                    value_text = value_block["text"].strip()
+                    if any(alias.lower() in value_text.lower() for alias in spec["labels"]):
+                        continue
+                    value_box = value_block["bounding_box"]
+                    vertical_delta = abs(value_box["y"] - label_box["y"])
+                    right_gap = value_box["x"] - (label_box["x"] + label_box["width"])
+                    below_gap = value_box["y"] - (label_box["y"] + label_box["height"])
+                    same_row = vertical_delta <= max(label_box["height"], value_box["height"]) * 1.2 and -10 <= right_gap <= 500
+                    below = -40 <= value_box["x"] - label_box["x"] <= 200 and 0 <= below_gap <= 120
+                    if same_row or below:
+                        distance_score = max(0.2, 1 - max(right_gap, below_gap, 0) / 600)
+                        candidates.append((value_text, value_block, distance_score, False))
+        best = None
+        for raw, block, spatial, same_block in candidates:
+            normalized, valid = self._normalize(raw, spec["type"])
+            if not normalized:
+                continue
+            confidence = (
+                block["confidence"] * 0.5
+                + spatial * 0.25
+                + (1.0 if valid else 0.25) * 0.25
+            )
+            if same_block:
+                confidence += 0.03
+            confidence = round(min(confidence, 1.0), 4)
+            if best is None or confidence > best["confidence"]:
+                best = self._field(normalized, raw, block, confidence, not valid)
+        if best:
+            return best
+        return self._field(None, None, None, 0.0, bool(spec.get("required")), missing=True)
+
+    def _filter_noise_blocks(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove empty, near-zero-confidence, and known pen-label blocks."""
+        _product_re = re.compile(
+            r"uni\b.*\bpin\b"                   # "uni pin FINE LINE" etc.
+            r"|\bfine\s+line\b"
+            r"|\brecap\b|\bmicron\b",
+            re.I,
+        )
+        cleaned = []
+        for b in blocks:
+            t = b["text"].strip()
+            if not t or len(t) < 2:
+                continue
+            if b["confidence"] < 0.05:
+                continue
+            if _product_re.search(t):
+                continue
+            cleaned.append(b)
+        return cleaned
+
+    def _assemble_free_text(self, blocks: List[Dict[str, Any]]) -> List[str]:
+        """Sort OCR blocks spatially, group into lines then paragraphs, trim trailing noise."""
+        valid = [b for b in blocks if b["text"].strip()]
+        if not valid:
+            return []
+
+        # Sort by page → Y → X
+        valid = sorted(valid, key=lambda b: (b["page"], b["bounding_box"]["y"], b["bounding_box"]["x"]))
+
+        # Group blocks into text lines by Y-center proximity
+        lines: List[List[Dict[str, Any]]] = []
+        current_line: List[Dict[str, Any]] = []
+        for block in valid:
+            if not current_line:
+                current_line = [block]
+                continue
+            last = current_line[-1]
+            last_cy = last["bounding_box"]["y"] + last["bounding_box"]["height"] / 2
+            curr_cy = block["bounding_box"]["y"] + block["bounding_box"]["height"] / 2
+            tolerance = max(last["bounding_box"]["height"], block["bounding_box"]["height"]) * 0.75
+            if abs(curr_cy - last_cy) <= tolerance:
+                current_line.append(block)
+            else:
+                lines.append(sorted(current_line, key=lambda b: b["bounding_box"]["x"]))
+                current_line = [block]
+        if current_line:
+            lines.append(sorted(current_line, key=lambda b: b["bounding_box"]["x"]))
+
+        # Trim lines that appear after a letter closing phrase
+        _closing = re.compile(r"\b(sincere|regards|respect|truly|sincerely|yours|warm|cheers)\b", re.I)
+        trim_at = len(lines)
+        for i, line in enumerate(lines):
+            line_text = " ".join(b["text"] for b in line)
+            if _closing.search(line_text):
+                trim_at = i + 1
+                break
+        if trim_at < len(lines):
+            lines = lines[:trim_at]
+
+        # Group lines into paragraphs by vertical gap
+        paragraphs: List[List[List[Dict[str, Any]]]] = []
+        current_para: List[List[Dict[str, Any]]] = []
+        for line in lines:
+            if not current_para:
+                current_para = [line]
+                continue
+            last_line = current_para[-1]
+            last_bottom = max(b["bounding_box"]["y"] + b["bounding_box"]["height"] for b in last_line)
+            curr_top = min(b["bounding_box"]["y"] for b in line)
+            gap = curr_top - last_bottom
+            avg_height = sum(b["bounding_box"]["height"] for b in last_line) / len(last_line)
+            if gap > avg_height * 1.6:
+                paragraphs.append(current_para)
+                current_para = [line]
+            else:
+                current_para.append(line)
+        if current_para:
+            paragraphs.append(current_para)
+
+        # Render each paragraph to a string
+        result: List[str] = []
+        for para in paragraphs:
+            line_texts = [
+                " ".join(b["text"].strip() for b in line if b["text"].strip())
+                for line in para
+            ]
+            para_text = " ".join(t for t in line_texts if t).strip()
+            if para_text:
+                result.append(para_text)
+        return result
+
+    def _generic_fields(self, blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
+        fields: Dict[str, Any] = {}
+
+        def make_key(text: str) -> str:
+            return re.sub(r"[^a-z0-9]+", "_", text.lower().strip(" :.-_")).strip("_")
+
+        def looks_like_label(text: str) -> bool:
+            s = text.strip(" :.-")
+            if not s or len(s) > 65 or len(s) < 2:
+                return False
+            return sum(c.isalpha() for c in s) / len(s) > 0.55
+
+        # Pass 1: "Label: value" on the same OCR line (original behaviour, kept as it's fast)
+        for block in blocks:
+            match = re.match(r"^\s*([A-Za-z][A-Za-z0-9 /()_.-]{1,50})\s*[:=-]\s*(.+?)\s*$", block["text"])
+            if not match:
+                continue
+            key = make_key(match.group(1))
+            value = match.group(2).strip()
+            if value and key and key not in fields:
+                fields[key] = self._field(value, block["text"], block, round(block["confidence"] * 0.8, 4), True)
+
+        # Pass 2: spatial proximity — label block paired with nearest right/below value block
+        for label_block in blocks:
+            label_text = label_block["text"].strip()
+            if not looks_like_label(label_text):
+                continue
+            key = make_key(label_text)
+            if not key or key in fields:
+                continue
+            label_box = label_block["bounding_box"]
+            best_value: Optional[str] = None
+            best_score = float("inf")
+            best_block: Optional[Dict[str, Any]] = None
+            for value_block in blocks:
+                if value_block is label_block or value_block["page"] != label_block["page"]:
+                    continue
+                value_text = value_block["text"].strip()
+                if not value_text or looks_like_label(value_text):
+                    continue
+                value_box = value_block["bounding_box"]
+                vertical_delta = abs(value_box["y"] - label_box["y"])
+                right_gap = value_box["x"] - (label_box["x"] + label_box["width"])
+                below_gap = value_box["y"] - (label_box["y"] + label_box["height"])
+                row_height = max(label_box["height"], value_box["height"])
+                same_row = vertical_delta <= row_height * 1.5 and 0 <= right_gap <= 600
+                below_row = -30 <= value_box["x"] - label_box["x"] <= 250 and 0 <= below_gap <= 150
+                if same_row:
+                    score = right_gap
+                elif below_row:
+                    score = below_gap + 300
+                else:
+                    continue
+                if score < best_score:
+                    best_score = score
+                    best_value = value_text
+                    best_block = value_block
+            if best_value and best_block:
+                fields[key] = self._field(
+                    best_value, best_value, best_block,
+                    round(best_block["confidence"] * 0.85, 4), True,
+                )
+        return fields
+
+    def _normalize(self, value: str, field_type: str) -> Tuple[Optional[str], bool]:
+        value = re.sub(r"\s+", " ", value).strip(" :;,_")
+        value = re.split(
+            r"\b(?:Enclosure Check List|Discharge Date|First prescription|Copy of proposer|Aadhar Card No)\b",
+            value,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" ,:;")
+        patterns = {
+            "email": r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$",
+            "phone": r"^\+?[\d ()-]{8,18}$",
+            "pan": r"^[A-Z]{5,6}[0-9]{4}[A-Z]$",
+            "pin": r"^\d{6}$",
+            "date": r"^(?:\d{1,2}[/.-]){2}\d{2,4}$",
+            "currency": r"^(?:Rs\.?|₹|\$)?\s*[\d,]+(?:\.\d{1,2})?$",
+            "identifier": r"^[A-Za-z0-9/_-]{3,}$",
+        }
+        if field_type in patterns:
+            pattern = patterns[field_type]
+            search_pattern = pattern[1:-1] if pattern.startswith("^") and pattern.endswith("$") else pattern
+            match = re.search(search_pattern, value, re.I)
+            if match:
+                value = match.group(0).strip()
+        if field_type == "email":
+            value = value.lower()
+        if field_type == "phone":
+            value = re.sub(r"\D", "", value)
+        if field_type == "pin":
+            value = re.sub(r"\D", "", value)[:6]
+        if field_type == "name":
+            value = value.strip(" .,:;")
+        valid = bool(re.match(patterns[field_type], value, re.I)) if field_type in patterns else len(value) >= 2
+        return value or None, valid
+
+    def _field(self, value, raw, block, confidence: float, invalid: bool, missing: bool = False) -> Dict[str, Any]:
+        review = invalid or (not missing and confidence < self.settings.review_confidence)
+        return {
+            "value": value,
+            "normalized_value": value,
+            "confidence": confidence,
+            "bounding_box": block["bounding_box"] if block else None,
+            "page": block["page"] if block else None,
+            "raw_text": raw,
+            "source_engine": block.get("source_engine") if block else None,
+            "review_required": review,
+        }

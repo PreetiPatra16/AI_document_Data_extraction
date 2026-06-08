@@ -1,116 +1,72 @@
-import React from 'react';
+import { AlertTriangle, CheckCircle2, Table2 } from 'lucide-react';
 import { ExtractionData } from '../types';
-import { ShieldCheck, ShieldAlert, Award, FileSpreadsheet } from 'lucide-react';
 
-interface ExtractionPanelProps {
-  data: ExtractionData;
+function label(value: string) {
+  return value.replace(/_/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
-export const ExtractionPanel: React.FC<ExtractionPanelProps> = ({ data }) => {
-  const getConfidenceLevel = (score: number) => {
-    if (score >= 0.85) return { color: 'text-emerald-500 bg-emerald-500/10', bar: 'bg-emerald-500', text: 'High Confidence' };
-    if (score >= 0.70) return { color: 'text-amber-500 bg-amber-500/10', bar: 'bg-amber-500', text: 'Medium Confidence' };
-    return { color: 'text-rose-500 bg-rose-500/10', bar: 'bg-rose-500', text: 'Low Confidence / Review Required' };
-  };
-
-  const getCleanLabel = (str: string) => {
-    return str
-      .replace(/_/g, ' ')
-      .replace(/\b\w/g, (c) => c.toUpperCase());
-  };
-
-  const summaryLevel = getConfidenceLevel(data.confidence_summary);
-
+export function ExtractionPanel({ data }: { data: ExtractionData }) {
   return (
-    <div className="bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800/80 rounded-2xl p-6 shadow-sm space-y-6">
-      {/* Title & Overall Score */}
-      <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800/60">
-        <div className="space-y-1">
-          <div className="flex items-center space-x-2">
-            <FileSpreadsheet className="h-5 w-5 text-brand-500" />
-            <h3 className="font-extrabold text-slate-900 dark:text-white text-base">
-              Extraction Audit
-            </h3>
+    <div className="space-y-5">
+      <section className={`rounded-2xl border p-5 ${data.review_required ? 'border-amber-300 bg-amber-50/60 dark:border-amber-900 dark:bg-amber-950/20' : 'border-emerald-200 bg-emerald-50/50 dark:border-emerald-900 dark:bg-emerald-950/20'}`}>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-xs font-extrabold uppercase tracking-wider text-slate-500">Document type</p>
+            <p className="mt-1 font-extrabold text-slate-900 dark:text-white">{label(data.document_type)}</p>
           </div>
-          <span className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider block">
-            Classification: {data.document_type.toUpperCase()}
-          </span>
-        </div>
-        
-        <div className="text-right">
-          <div className={`inline-flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold ${summaryLevel.color}`}>
-            <Award className="h-4 w-4" />
-            <span>Score: {Math.round(data.confidence_summary * 100)}%</span>
+          <div className="text-right">
+            <p className="text-2xl font-extrabold">{Math.round(data.confidence_summary * 100)}%</p>
+            <p className="text-[10px] font-extrabold uppercase tracking-wider text-slate-500">Overall confidence</p>
           </div>
-          <span className="block text-[10px] font-bold text-slate-400 dark:text-slate-500 mt-1 uppercase">
-            {summaryLevel.text}
-          </span>
         </div>
-      </div>
+        {data.review_required && <p className="mt-4 flex items-center gap-2 text-xs font-bold text-amber-800 dark:text-amber-300"><AlertTriangle className="h-4 w-4" /> Review is recommended before using this result.</p>}
+      </section>
 
-      {/* Field List */}
-      <div className="space-y-4">
-        {Object.entries(data.fields).map(([fieldName, field]) => {
-          const fieldLevel = getConfidenceLevel(field.confidence);
-          const isLow = field.confidence < 0.7;
+      {data.warnings.length > 0 && (
+        <section className="rounded-2xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-900 dark:bg-amber-950/20">
+          <h3 className="text-xs font-extrabold uppercase tracking-wider text-amber-800 dark:text-amber-300">Extraction notices</h3>
+          <ul className="mt-2 space-y-1 text-sm text-amber-900 dark:text-amber-200">
+            {data.warnings.map((warning) => <li key={warning}>• {warning}</li>)}
+          </ul>
+        </section>
+      )}
 
-          return (
-            <div 
-              key={fieldName} 
-              className={`p-4 rounded-xl border transition-all duration-200 ${
-                isLow 
-                  ? 'border-rose-200/60 bg-rose-50/10 dark:border-rose-950/20' 
-                  : 'border-slate-100 bg-slate-50/30 dark:border-slate-850/20 dark:border-slate-800/40 hover:bg-slate-50/50 dark:hover:bg-slate-850/40'
-              }`}
-            >
-              <div className="flex items-start justify-between mb-2">
-                <div className="space-y-0.5">
-                  <span className="text-xs font-bold text-slate-400 dark:text-slate-550 uppercase tracking-wider">
-                    {getCleanLabel(fieldName)}
-                  </span>
-                  <div className="flex items-center space-x-2">
-                    <span className="text-sm font-bold text-slate-800 dark:text-slate-100">
-                      {field.value !== null ? String(field.value) : <span className="text-slate-400 italic font-medium">Not detected</span>}
-                    </span>
-                    {field.page && (
-                      <span className="text-[10px] font-bold bg-slate-200/50 dark:bg-slate-800 px-1.5 py-0.5 rounded text-slate-500 dark:text-slate-400">
-                        P.{field.page}
-                      </span>
-                    )}
-                  </div>
+      <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+        <div className="border-b border-slate-200 px-5 py-4 dark:border-slate-800">
+          <h3 className="font-extrabold">Extracted fields</h3>
+          <p className="text-xs text-slate-500">Read-only values returned by the local extraction service.</p>
+        </div>
+        <div className="divide-y divide-slate-100 dark:divide-slate-800">
+          {Object.entries(data.fields).map(([name, field]) => {
+            const value = field.normalized_value ?? field.value;
+            return (
+              <div key={name} className={`grid gap-3 px-5 py-4 sm:grid-cols-[minmax(150px,1fr)_2fr_auto] ${field.review_required ? 'bg-amber-50/70 dark:bg-amber-950/10' : ''}`}>
+                <div>
+                  <p className="text-xs font-extrabold uppercase tracking-wider text-slate-500">{label(name)}</p>
+                  {field.page && <p className="mt-1 text-[10px] font-bold text-slate-400">Page {field.page}</p>}
                 </div>
-
-                <div className="text-right">
-                  <div className="flex items-center justify-end space-x-1 text-xs font-extrabold text-slate-700 dark:text-slate-350">
-                    {isLow ? (
-                      <ShieldAlert className="h-3.5 w-3.5 text-rose-500" />
-                    ) : (
-                      <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" />
-                    )}
-                    <span>{Math.round(field.confidence * 100)}%</span>
-                  </div>
+                <p className="break-words text-sm font-bold">{value === null || value === '' ? <span className="font-medium italic text-slate-400">Not detected</span> : String(value)}</p>
+                <div className="flex items-center gap-2 text-xs font-extrabold">
+                  {field.review_required ? <AlertTriangle className="h-4 w-4 text-amber-500" /> : <CheckCircle2 className="h-4 w-4 text-emerald-500" />}
+                  {Math.round(field.confidence * 100)}%
                 </div>
               </div>
+            );
+          })}
+          {Object.keys(data.fields).length === 0 && <p className="px-5 py-8 text-center text-sm text-slate-500">No fields were extracted.</p>}
+        </div>
+      </section>
 
-              {/* Progress Slider */}
-              <div className="w-full bg-slate-200/80 dark:bg-slate-800 h-1.5 rounded-full overflow-hidden mb-2">
-                <div 
-                  className={`h-full rounded-full transition-all duration-300 ${fieldLevel.bar}`}
-                  style={{ width: `${field.confidence * 100}%` }}
-                />
-              </div>
-
-              {/* Debug raw text snippet if low confidence */}
-              {isLow && field.raw_text && (
-                <div className="mt-2 text-[10px] font-medium bg-rose-50 dark:bg-rose-950/20 text-rose-800 dark:text-rose-455 p-2 rounded-lg border border-rose-250/20">
-                  <span className="font-bold block uppercase mb-0.5">Raw Text Bounding Anchor</span>
-                  "{field.raw_text}"
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
+      {data.tables.map((table) => (
+        <section key={`${table.name}-${table.page}`} className="overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+          <div className="flex items-center gap-2 border-b border-slate-200 px-5 py-4 dark:border-slate-800">
+            <Table2 className="h-4 w-4 text-brand-500" />
+            <h3 className="font-extrabold">{label(table.name)}</h3>
+            <span className="text-xs text-slate-500">Page {table.page} · {Math.round(table.confidence * 100)}%</span>
+          </div>
+          <pre className="overflow-auto p-5 text-xs">{JSON.stringify(table.rows, null, 2)}</pre>
+        </section>
+      ))}
     </div>
   );
-};
+}

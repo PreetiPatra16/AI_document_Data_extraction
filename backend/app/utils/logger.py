@@ -1,10 +1,11 @@
 import sys
 import os
 from loguru import logger
+from app.core.config import settings
 
 def setup_logger():
-    log_level = os.getenv("LOG_LEVEL", "INFO")
-    log_file = os.getenv("LOG_FILE", "logs/app.log")
+    log_level = settings.log_level
+    log_file = settings.log_file
     
     # Create logs directory if it doesn't exist
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
