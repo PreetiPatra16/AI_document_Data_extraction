@@ -1,6 +1,6 @@
 # AI-Based Document Data Extraction System
 
-An enterprise-grade document data extraction suite designed to process scanned documents, printed forms, mixed printed/handwritten content, and PDFs, running entirely locally on a single machine with zero external cloud dependencies
+An enterprise-grade document data extraction suite designed to process scanned documents, printed forms, mixed printed/handwritten content, and PDFs, running entirely locally on a single machine with zero external cloud dependencies.
 
 ## One-Command Docker Startup
 
@@ -33,6 +33,31 @@ Convenience launchers are also available:
 # Windows PowerShell
 .\start.ps1
 ```
+
+On Windows, run the launcher from PowerShell, not Command Prompt. If Windows
+blocks local scripts with an execution-policy error, allow this invocation only:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+The launcher verifies Docker Compose configuration and the complete frontend
+proxy path (`frontend -> api`). If startup fails, it prints container status and
+the relevant recent logs. You can collect the same diagnostics manually on any
+platform:
+
+```bash
+docker compose config --quiet
+docker compose ps -a
+docker compose logs --tail 100 model-init api frontend
+```
+
+Because both application containers are Linux containers, their networking and
+proxy behavior can be tested on macOS or Linux. The Windows-specific surface is
+the small PowerShell launcher; the application itself still uses the same
+Compose file, images, service names, and Docker network. The `Validate
+launchers` GitHub Actions workflow also parses the PowerShell launchers on a
+real Windows runner.
 
 Stop the stack without deleting retained results or models:
 

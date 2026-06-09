@@ -82,7 +82,9 @@ services:
       api:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      # Check the same reverse-proxy route used by the browser. This catches a
+      # frontend container that is running but cannot reach the API container.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/v1/health/ready"]
       interval: 15s
       timeout: 5s
       retries: 5
