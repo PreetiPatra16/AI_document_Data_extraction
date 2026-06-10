@@ -44,13 +44,15 @@ SCHEMAS: Dict[str, Dict[str, Any]] = {
     },
     "motor_claim_form": {
         "anchors": ["motor claim form", "claim form", "vehicle"],
+
         "fields": {
-            "insured_name": {"labels": ["name of insured", "insured name"], "type": "name", "required": True},
-            "policy_number": {"labels": ["policy no", "policy number"], "type": "identifier"},
-            "claim_number": {"labels": ["claim no", "claim number"], "type": "identifier"},
-            "mobile": {"labels": ["mobile no", "mobile number"], "type": "phone"},
-            "email": {"labels": ["email", "e-mail"], "type": "email"},
-            "vehicle_registration": {"labels": ["registration no", "vehicle registration"], "type": "identifier"},
+
+            "insured_name": {"labels": ["insured details name","insured name"],"type": "name","required": True},
+            "policy_number": {"labels": ["policy number","policy no"],"type": "identifier"},
+            "claim_number": {"labels": ["claim number","claim no"],"type": "identifier"},
+            "mobile": {"labels": ["mobile","mobile no","mobile number"],"type": "phone"},
+            "email": {"labels": ["email","email id","e-mail"],"type": "email"},
+            "vehicle_registration": {"labels": ["vehicle number","vehicle registration","registration no"],"type": "identifier"}
         },
     },
 }
@@ -151,11 +153,62 @@ class ExtractionService:
         return avg_len > 20 and colon_pct < 0.25 and long_block_pct > 0.4
 
     def _extract_field(self, blocks: List[Dict[str, Any]], spec: Dict[str, Any]) -> Dict[str, Any]:
+        full_text = " ".join(
+            b["text"]
+            for b in blocks
+        )
         candidates: List[Tuple[str, Dict[str, Any], float, bool]] = []
+        
         for label_block in blocks:
             label_text = label_block["text"].strip()
             label_lower = label_text.lower()
             for label in spec["labels"]:
+
+                field_type = spec.get("type")
+
+                if field_type == "name":
+
+                    match = re.search(
+                        r"insured details\s+name\s+([A-Z\s]{5,80})",
+                        full_text,
+                        re.I,
+                    )
+
+                    if match:
+
+                        extracted_name = match.group(1)
+                        extracted_name = re.split(
+                            r"\b(Address|Mobile|State|Email)\b",
+                            extracted_name,
+                            flags=re.I,
+                        )[0].strip()
+                        candidates.append(
+                            (
+                                extracted_name,
+                                label_block,
+                                1.0,
+                                True,
+                            )
+                        )  
+
+                elif field_type == "identifier":
+
+                    match = re.search(
+                        rf"{re.escape(label)}\s+([A-Z0-9-]{{4,25}})",
+                    label_text,
+                    re.I,
+                    )
+
+                    if match:
+                        candidates.append(
+                            (
+                                match.group(1).strip(),
+                                label_block,
+                                1.0,
+                                True,
+                            )
+                        )
+        
                 position = label_lower.find(label.lower())
                 if position < 0:
                     continue
@@ -180,7 +233,30 @@ class ExtractionService:
                         candidates.append((value_text, value_block, distance_score, False))
         best = None
         for raw, block, spatial, same_block in candidates:
+
+            if "vehicle" in " ".join(spec["labels"]).lower():
+                match = re.search(
+                    r"MH\d{2}[A-Z]{1,3}\d{4}",
+                    full_text,
+                    re.I
+                )
+                
+                if match:
+                    normalized = match.group(0)
+                    return self._field(
+                        normalized,
+                        raw,
+                        block,
+                        0.99,
+                        False
+                    )
+
             normalized, valid = self._normalize(raw, spec["type"])
+
+            if normalized == "Name":
+                continue
+            if normalized in ["Address", "Mobile", "State", "Email"]:
+                continue
             if not normalized:
                 continue
             confidence = (
@@ -353,6 +429,11 @@ class ExtractionService:
         return fields
 
     def _normalize(self, value: str, field_type: str) -> Tuple[Optional[str], bool]:
+
+        if field_type == "email":
+            value = value.replace(" @ ", "@")
+            value = value.replace(" gmail ", "@gmail.")
+            value = value.replace(" com", ".com")
         value = re.sub(r"\s+", " ", value).strip(" :;,_")
         value = re.split(
             r"\b(?:Enclosure Check List|Discharge Date|First prescription|Copy of proposer|Aadhar Card No)\b",
@@ -376,8 +457,14 @@ class ExtractionService:
             if match:
                 value = match.group(0).strip()
         if field_type == "email":
+            value = value.replace(" @ ", "@")
+            value = value.replace("@ ", "@")
+            value = value.replace(" @", "@")
+            if "@gmail" in value and ".com" not in value:
+                value += ".com"
             value = value.lower()
         if field_type == "phone":
+            value = (value.replace("%", "9").replace("O", "0").replace("o", "0"))
             value = re.sub(r"\D", "", value)
         if field_type == "pin":
             value = re.sub(r"\D", "", value)[:6]
