@@ -88,7 +88,8 @@ The codebase follows **Clean Architecture** patterns, decoupling storage, comput
 - **CV Preprocessing Service (`preprocessing_service.py`)**: Uses OpenCV to deskew (minAreaRect box rotation), denoise (fastNlMeansDenoising), and threshold (adaptiveThreshold) inputs to maximize local OCR recognition accuracy.
 - **Local OCR Engine Core (`ocr_service.py`)**: Automatically selects **PaddleOCR** as primary (highly effective for mixed and handwritten lines) with a secondary fallback to **Tesseract** if OCR confidence ratings drop.
 - **Audit Field Extractor Service (`extraction_service.py`)**: To mitigate risks associated with dynamic layouts in V1, a template-matching label router maps coordinates, applies regular expressions, and returns strict confidence ratings computed as:
-  $$\text{Confidence} = (\text{OCR\_Confidence} \times 0.4) + (\text{Regex\_Match} \times 0.3) + (\text{Proximity\_Distance\_Factor} \times 0.3)$$
+  $$\text{Confidence} = (\text{OCR\_Confidence} \times 0.25) + (\text{Regex\_Match} \times 0.3) + (\text{Proximity\_Distance\_Factor} \times 0.45)$$
+  Proximity dominates deliberately: handwritten values carry low OCR confidence, so weighting OCR confidence higher selects printed boilerplate over the actual answer.
 - **Operator Workspace (React / TypeScript)**: Stages document batches, provides session-only previews, limits concurrent processing, monitors jobs, and presents retained extraction results without implying that source documents remain stored.
 
 Frontend setup, routes, architecture, and integration rules are documented in

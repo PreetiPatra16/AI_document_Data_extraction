@@ -1,7 +1,8 @@
 import re
 from difflib import SequenceMatcher
+from functools import lru_cache
 from statistics import mean
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from loguru import logger
 
@@ -11,7 +12,12 @@ from app.middleware.error_handler import ExtractionException
 
 SCHEMAS: Dict[str, Dict[str, Any]] = {
     "health_claim_form": {
-        "anchors": ["claimant / patient details", "personal details of employee", "claim details"],
+        "anchors": [
+            "health insurance claim form",
+            "claimant / patient details",
+            "personal details of employee",
+            "claim details",
+        ],
         "fields": {
             "employee_name": {"labels": ["name of the employee / individual", "name of employee / proposer"], "type": "name", "required": True},
             "employee_email": {"labels": ["e-mail address of the employee/individual", "email address"], "type": "email"},
@@ -29,33 +35,127 @@ SCHEMAS: Dict[str, Dict[str, Any]] = {
             "family_physician": {"labels": ["name of family physician"], "type": "name"},
             "family_physician_mobile": {"labels": ["mobile no. of family physician"], "type": "phone"},
         },
+        "decoys": [
+            "aadhar card no", "claimed amount in words", "relationship with the employee / proposer",
+            "details of other existing health policies", "ongoing medication", "enclosure check list",
+            "policy no", "health card no. of patient", "policy start date", "policy end date",
+            "corporate name", "employee id",
+        ],
+        # All extracted fields sit on page 1 of the claim form.
+        "default_page": 1,
     },
     "health_proposal_form": {
-        "anchors": ["proposal form for health total", "proposer details", "details of persons to be insured"],
+        "anchors": [
+            "proposal form for health total",
+            "details of persons to be insured",
+            "permanent address and other details",
+            "proposer details",
+        ],
         "fields": {
             "proposer_name": {"labels": ["proposer details", "name"], "type": "name", "required": True},
-            "permanent_address": {"labels": ["permanent address and other details"], "type": "address"},
+            "permanent_address": {"labels": ["permanent address and other details", "permanent address"], "type": "address"},
             "state": {"labels": ["state"], "type": "string"},
             "pin_code": {"labels": ["pin code"], "type": "pin"},
             "mobile": {"labels": ["mobile no", "mobile no*"], "type": "phone"},
             "email": {"labels": ["email id", "email"], "type": "email"},
+            "pan": {"labels": ["pan"], "type": "pan"},
+            "date_of_birth": {"labels": ["date of birth"], "type": "date"},
             "occupation": {"labels": ["occupation"], "type": "string"},
         },
+        "decoys": [
+            "received date", "branch code", "branch name", "tel no", "fax no",
+            "annual gross income", "family doctor details", "e-ia number",
+            "e-insurance account number", "io no", "app no", "client code",
+            "receipt no", "payer id", "sb/ca acc no", "journal no", "present address",
+        ],
+        # Proposer fields live on page 1 of the multi-page template.
+        "default_page": 1,
     },
     "motor_claim_form": {
-        "anchors": ["motor claim form", "claim form", "vehicle"],
-
+        "anchors": [
+            "motor claim form",
+            "loss details",
+            "driver details at the time of accident",
+            "insured details",
+        ],
         "fields": {
-
-            "insured_name": {"labels": ["insured details name","insured name"],"type": "name","required": True},
-            "policy_number": {"labels": ["policy number","policy no"],"type": "identifier"},
-            "claim_number": {"labels": ["claim number","claim no"],"type": "identifier"},
-            "mobile": {"labels": ["mobile","mobile no","mobile number"],"type": "phone"},
-            "email": {"labels": ["email","email id","e-mail"],"type": "email"},
-            "vehicle_registration": {"labels": ["vehicle number","vehicle registration","registration no"],"type": "identifier"}
+            "insured_name": {"labels": ["name"], "type": "name", "required": True, "section": "insured details"},
+            "policy_number": {"labels": ["policy number", "policy no"], "type": "identifier"},
+            "claim_number": {"labels": ["claim number", "claim no"], "type": "identifier"},
+            "vehicle_registration": {"labels": ["vehicle number", "vehicle registration", "registration no"], "type": "identifier"},
+            "address": {"labels": ["address"], "type": "address", "section": "insured details"},
+            "state": {"labels": ["state"], "type": "string", "section": "insured details"},
+            "mobile": {"labels": ["mobile", "mobile no", "mobile number"], "type": "phone", "section": "insured details"},
+            "email": {"labels": ["email", "email id", "e-mail"], "type": "email", "section": "insured details"},
+            "place_of_accident": {"labels": ["place of accident"], "type": "string"},
+            "accident_date": {"labels": ["date & time of accident", "date of accident"], "type": "date"},
         },
+        "decoys": [
+            "ifsc code", "micr", "a/c no", "aadhar no", "pan no", "bank details - bank name",
+            "branch", "landline", "pin-code", "type of a/c", "name (as per bank account)",
+            "police report details", "name of rto", "learners license", "driver license no",
+            "permit no", "permit valid up to", "contact no", "city",
+        ],
+    },
+    "office_proposal_form": {
+        "anchors": [
+            "office suraksha proposal form",
+            "occupation / business activity",
+            "name of proposer / insured",
+        ],
+        "fields": {
+            "proposer_name": {
+                "labels": [
+                    "name of proposer / insured along with correspondence address",
+                    "name of proposer / insured",
+                    "name of proposer",
+                ],
+                "type": "name",
+                "required": True,
+            },
+            "address": {"labels": ["address of proposer / insured premises", "address of proposer"], "type": "address"},
+            "city": {"labels": ["city"], "type": "string"},
+            "state": {"labels": ["state"], "type": "string"},
+            "pin_code": {"labels": ["pin code"], "type": "pin"},
+            "email": {"labels": ["e-mail", "email"], "type": "email"},
+            "occupation": {"labels": ["occupation / business activity", "occupation"], "type": "string"},
+        },
+        "decoys": [
+            "telephone (o)", "fax no", "policy period", "coverage proposed",
+            "hypothecation", "building construction", "year of production",
+            "name of manufacturer", "date of manufacture", "reinstatement value",
+        ],
     },
 }
+
+# Field types whose values must match their validation pattern to be accepted.
+STRICT_TYPES = {"email", "phone", "pan", "pin", "date", "currency", "identifier", "address"}
+
+# Form vocabulary that never appears inside a person's name. Used to reject
+# label fragments and headings that get picked up as name candidates.
+NAME_STOPWORDS = {
+    "name", "address", "mobile", "state", "email", "city", "details", "signature",
+    "declaration", "bank", "branch", "number", "code", "permanent", "present",
+    "account", "form", "proposal", "insurance", "health", "total", "office",
+    "claim", "policy", "vehicle", "period", "gender", "nationality", "marital",
+    "occupation", "telephone", "district", "landmark", "manufacturer", "mr",
+    "ms", "mrs", "m/s", "tick", "please", "above", "same", "premises",
+    "correspondence",
+}
+
+KNOWN_EMAIL_PROVIDERS = ("gmail", "yahoo", "hotmail", "outlook", "rediffmail")
+EMAIL_RE = re.compile(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$", re.I)
+TLD_RE = re.compile(r"\b(com|in|net|org|co\.in|edu|gov)\b", re.I)
+
+# A same-block remainder starting with a connective means the label match was a
+# prefix of a longer label ("Name of manufacturer"), not a label/value pair.
+LABEL_CONTINUATION_RE = re.compile(r"^(of|the|and|in|for|as|per|to|with|details?)\b", re.I)
+
+# Section headings, boilerplate, and label-like fragments ("Tel No") that must
+# never be picked as field values.
+VALUE_NOISE_RE = re.compile(
+    r"\b(details?|declaration|signature|checklist|check list|no\.?|number|id)\s*[:.]?\s*$", re.I
+)
 
 
 class ExtractionService:
@@ -67,7 +167,7 @@ class ExtractionService:
             clean_blocks = self._filter_noise_blocks(ocr_results)
             document_type = self.classify(clean_blocks)
             warnings: List[str] = []
-            paragraphs = self._assemble_free_text(clean_blocks)
+            paragraphs = self._assemble_free_text(clean_blocks, trim_closing=document_type == "free_text_document")
             raw_text = "\n\n".join(paragraphs)
 
             if document_type == "free_text_document":
@@ -89,7 +189,21 @@ class ExtractionService:
 
             schema = SCHEMAS.get(document_type)
             if schema:
-                fields = {name: self._extract_field(clean_blocks, spec) for name, spec in schema["fields"].items()}
+                # Decoy labels are form fields we do not extract; knowing them
+                # stops their values being attributed to neighbouring fields.
+                schema_labels = [
+                    label for spec in schema["fields"].values() for label in spec["labels"]
+                ] + list(schema.get("decoys", []))
+                label_block_ids = {
+                    id(b) for b in clean_blocks if self._is_schema_label_block(b["text"].strip(), schema_labels)
+                }
+                default_page = schema.get("default_page")
+                fields = {
+                    name: self._extract_field(
+                        clean_blocks, spec, schema_labels, label_block_ids, default_page
+                    )
+                    for name, spec in schema["fields"].items()
+                }
             else:
                 fields = self._generic_fields(clean_blocks)
                 warnings.append("unsupported_template")
@@ -117,6 +231,7 @@ class ExtractionService:
 
     def classify(self, blocks: List[Dict[str, Any]]) -> str:
         text = " ".join(block["text"].lower() for block in blocks)
+        text = re.sub(r"\s+", " ", text)
         tokens = set(text.split())
         scores: Dict[str, float] = {}
         for name, schema in SCHEMAS.items():
@@ -126,17 +241,12 @@ class ExtractionService:
                     score += 2.0
                 else:
                     anchor_tokens = set(anchor.lower().split())
-                    if anchor_tokens:
-                        overlap = len(anchor_tokens & tokens) / len(anchor_tokens)
-                        if overlap >= 0.6:
-                            score += overlap
-                        else:
-                            ratio = SequenceMatcher(None, anchor.lower(), text).ratio()
-                            if ratio >= 0.7:
-                                score += ratio
+                    overlap = len(anchor_tokens & tokens) / len(anchor_tokens) if anchor_tokens else 0.0
+                    if overlap >= 0.75:
+                        score += overlap
             scores[name] = score
         winner = max(scores, key=scores.get)
-        if scores[winner] >= 0.6:
+        if scores[winner] >= 2.0:
             return winner
         if self._is_free_text(blocks):
             return "free_text_document"
@@ -152,126 +262,358 @@ class ExtractionService:
         long_block_pct = sum(1 for b in valid if len(b["text"].split()) >= 5) / len(valid)
         return avg_len > 20 and colon_pct < 0.25 and long_block_pct > 0.4
 
-    def _extract_field(self, blocks: List[Dict[str, Any]], spec: Dict[str, Any]) -> Dict[str, Any]:
-        full_text = " ".join(
-            b["text"]
-            for b in blocks
-        )
+    @staticmethod
+    @lru_cache(maxsize=512)
+    def _label_pattern(label: str) -> re.Pattern:
+        """Word-boundary label matcher tolerant of OCR whitespace; avoids
+        matching 'state' inside 'statements'."""
+        escaped = re.escape(label.lower()).replace(r"\ ", r"\s*")
+        return re.compile(r"(?<![a-z0-9])" + escaped + r"(?![a-z])")
+
+    @staticmethod
+    def _fuzzy_label_end(text_lower: str, label: str) -> Optional[Tuple[int, float]]:
+        """Photographed printed labels OCR imperfectly ('Chaliny Numbar' for
+        'Claim Number'); match the block prefix approximately and return the
+        position where the label ends plus the match ratio."""
+        if len(label) < 5:
+            return None
+        # Ignore list numbering ("2. Address ...") when aligning the prefix.
+        offset_match = re.match(r"\s*\d{1,2}\s*[.)]\s*", text_lower)
+        offset = offset_match.end() if offset_match else 0
+        body = text_lower[offset:]
+        # Labels sharing a long tail ("address of proposer / insured" vs
+        # "name of proposer / insured") must not cross-match: the first words
+        # have to resemble each other too.
+        label_head = label.split()[0]
+        body_head = body.split()[0] if body.split() else ""
+        if SequenceMatcher(None, label_head, body_head).ratio() < 0.5:
+            return None
+        best_end, best_ratio = None, 0.0
+        for end in range(max(len(label) - 2, 1), min(len(label) + 3, len(body)) + 1):
+            ratio = SequenceMatcher(None, label, body[:end]).ratio()
+            if ratio > best_ratio:
+                best_ratio, best_end = ratio, end
+        if best_ratio >= 0.66:
+            # Snap to the next whitespace so the remainder starts on a clean
+            # token boundary ("Eman kadira..." must not leave a stray "n").
+            end = offset + best_end
+            while end < len(text_lower) and not text_lower[end].isspace():
+                end += 1
+            return end, best_ratio
+        return None
+
+    @staticmethod
+    def _section_anchor(blocks: List[Dict[str, Any]], section: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not section:
+            return None
+        pattern = ExtractionService._label_pattern(section)
+        for block in blocks:
+            if pattern.search(block["text"].lower()):
+                return block
+        return None
+
+    @staticmethod
+    def _section_factor(label_block: Dict[str, Any], anchor: Optional[Dict[str, Any]]) -> float:
+        if anchor is None:
+            return 1.0
+        if label_block["page"] != anchor["page"]:
+            return 0.5
+        delta = label_block["bounding_box"]["y"] - anchor["bounding_box"]["y"]
+        return 1.0 if -20 <= delta <= 400 else 0.5
+
+    def _cut_at_labels(self, value: str, schema_labels: List[str], current_label: str) -> str:
+        """Trim a same-line value at the next field label that follows it."""
+        cut = len(value)
+        lowered = value.lower()
+        for label in schema_labels:
+            if label == current_label:
+                continue
+            match = self._label_pattern(label).search(lowered)
+            if match and 0 < match.start() < cut:
+                cut = match.start()
+        return value[:cut].strip(" :;_")
+
+    def _is_schema_label_block(self, text: str, schema_labels: List[str]) -> bool:
+        """True when a block is just a field label (possibly with separators)."""
+        stripped = text.strip(" :*.-_").lower()
+        if not stripped:
+            return True
+        for label in schema_labels:
+            match = self._label_pattern(label).match(stripped)
+            if match and len(stripped) - match.end() <= 3:
+                return True
+        return False
+
+    def _extract_field(
+        self,
+        blocks: List[Dict[str, Any]],
+        spec: Dict[str, Any],
+        schema_labels: List[str],
+        label_block_ids: Set[int],
+        default_page: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        field_type = spec.get("type", "string")
+        expected_page = spec.get("page", default_page)
+        anchor = self._section_anchor(blocks, spec.get("section"))
         candidates: List[Tuple[str, Dict[str, Any], float, bool]] = []
-        
+
         for label_block in blocks:
             label_text = label_block["text"].strip()
-            label_lower = label_text.lower()
+            text_lower = label_text.lower()
+            # Prefer the longest alias of this field that matches the block, so
+            # "Occupation / Business Activity" is consumed whole rather than
+            # leaving "/ Business Activity" as a remainder.
+            label_end, matched_label, label_factor = None, None, 1.0
             for label in spec["labels"]:
-
-                field_type = spec.get("type")
-
-                if field_type == "name":
-
-                    match = re.search(
-                        r"insured details\s+name\s+([A-Z\s]{5,80})",
-                        full_text,
-                        re.I,
-                    )
-
-                    if match:
-
-                        extracted_name = match.group(1)
-                        extracted_name = re.split(
-                            r"\b(Address|Mobile|State|Email)\b",
-                            extracted_name,
-                            flags=re.I,
-                        )[0].strip()
-                        candidates.append(
-                            (
-                                extracted_name,
-                                label_block,
-                                1.0,
-                                True,
-                            )
-                        )  
-
-                elif field_type == "identifier":
-
-                    match = re.search(
-                        rf"{re.escape(label)}\s+([A-Z0-9-]{{4,25}})",
-                    label_text,
-                    re.I,
-                    )
-
-                    if match:
-                        candidates.append(
-                            (
-                                match.group(1).strip(),
-                                label_block,
-                                1.0,
-                                True,
-                            )
-                        )
-        
-                position = label_lower.find(label.lower())
-                if position < 0:
+                match = self._label_pattern(label).search(text_lower)
+                if match and (label_end is None or match.end() > label_end):
+                    label_end, matched_label = match.end(), label
+            if label_end is None:
+                if id(label_block) in label_block_ids:
+                    # The block exactly matches another field's label; fuzzy
+                    # matching it here would steal that field's value.
                     continue
-                remainder = re.sub(r"^[\s:.\-–]+", "", label_text[position + len(label):]).strip()
-                if remainder:
-                    candidates.append((remainder, label_block, 1.0, True))
-                label_box = label_block["bounding_box"]
-                for value_block in blocks:
-                    if value_block is label_block or value_block["page"] != label_block["page"]:
-                        continue
-                    value_text = value_block["text"].strip()
-                    if any(alias.lower() in value_text.lower() for alias in spec["labels"]):
-                        continue
-                    value_box = value_block["bounding_box"]
-                    vertical_delta = abs(value_box["y"] - label_box["y"])
-                    right_gap = value_box["x"] - (label_box["x"] + label_box["width"])
-                    below_gap = value_box["y"] - (label_box["y"] + label_box["height"])
-                    same_row = vertical_delta <= max(label_box["height"], value_box["height"]) * 1.2 and -10 <= right_gap <= 500
-                    below = -40 <= value_box["x"] - label_box["x"] <= 200 and 0 <= below_gap <= 120
-                    if same_row or below:
-                        distance_score = max(0.2, 1 - max(right_gap, below_gap, 0) / 600)
-                        candidates.append((value_text, value_block, distance_score, False))
-        best = None
-        for raw, block, spatial, same_block in candidates:
+                best_fuzzy: Optional[Tuple[int, float, str]] = None
+                for label in spec["labels"]:
+                    fuzzy = self._fuzzy_label_end(text_lower, label)
+                    if fuzzy and (best_fuzzy is None or fuzzy[1] > best_fuzzy[1]):
+                        best_fuzzy = (fuzzy[0], fuzzy[1], label)
+                if best_fuzzy is None:
+                    continue
+                # Fuzzy matches rank below exact matches of other labels.
+                label_end, matched_label = best_fuzzy[0], best_fuzzy[2]
+                label_factor = best_fuzzy[1] * 0.95
+            section_factor = self._section_factor(label_block, anchor) * label_factor
+            if expected_page is not None and label_block["page"] != expected_page:
+                section_factor *= 0.6
 
-            if "vehicle" in " ".join(spec["labels"]).lower():
-                match = re.search(
-                    r"MH\d{2}[A-Z]{1,3}\d{4}",
-                    full_text,
-                    re.I
+            remainder = re.sub(r"^[\s:.\-–*_]+", "", label_text[label_end:]).strip()
+            if remainder and not LABEL_CONTINUATION_RE.match(remainder):
+                remainder = self._cut_at_labels(remainder, schema_labels, matched_label)
+                if remainder and sum(c.isalnum() for c in remainder) >= 2:
+                    candidates.append((remainder, label_block, 1.0 * section_factor, True))
+
+            label_box = label_block["bounding_box"]
+            for value_block in blocks:
+                if value_block is label_block or value_block["page"] != label_block["page"]:
+                    continue
+                value_text = value_block["text"].strip()
+                if not value_text or id(value_block) in label_block_ids:
+                    continue
+                if sum(c.isalnum() for c in value_text) < 2:
+                    continue
+                if VALUE_NOISE_RE.search(value_text):
+                    continue
+                value_words = re.findall(r"[a-z]{2,}", value_text.lower())
+                if value_words and all(word in NAME_STOPWORDS for word in value_words):
+                    continue
+                # A block beginning with another field's label ("State HIMACHAL
+                # ... Pin Code ...") carries that field's value, not this one's.
+                value_lower = value_text.lower()
+                if any(
+                    self._label_pattern(other).match(value_lower)
+                    for other in schema_labels
+                    if other not in spec["labels"]
+                ):
+                    continue
+                value_text = self._cut_at_labels(value_text, schema_labels, matched_label)
+                if not value_text or sum(c.isalnum() for c in value_text) < 2:
+                    continue
+                value_box = value_block["bounding_box"]
+                label_cy = label_box["y"] + label_box["height"] / 2
+                value_cy = value_box["y"] + value_box["height"] / 2
+                vertical_delta = abs(value_cy - label_cy)
+                right_gap = value_box["x"] - (label_box["x"] + label_box["width"])
+                below_gap = value_box["y"] - (label_box["y"] + label_box["height"])
+                row_height = max(label_box["height"], value_box["height"])
+                same_row = vertical_delta <= row_height * 1.2 and -10 <= right_gap <= 600
+                # Handwriting often overlaps the printed label row, so allow a
+                # slightly negative gap for the below relation.
+                below = (
+                    -40 <= value_box["x"] - label_box["x"] <= 250
+                    and -row_height * 0.6 <= below_gap <= 150
                 )
-                
-                if match:
-                    normalized = match.group(0)
-                    return self._field(
-                        normalized,
-                        raw,
-                        block,
-                        0.99,
-                        False
-                    )
+                if same_row:
+                    spatial = max(0.3, 1.0 - max(right_gap, 0) / 700)
+                elif below:
+                    spatial = max(0.25, 0.75 - below_gap / 400)
+                else:
+                    continue
+                if self._another_label_owns_value(
+                    blocks, label_block, value_block, label_block_ids, same_row
+                ):
+                    continue
+                candidates.append((value_text, value_block, spatial * section_factor, False))
 
-            normalized, valid = self._normalize(raw, spec["type"])
-
-            if normalized == "Name":
-                continue
-            if normalized in ["Address", "Mobile", "State", "Email"]:
-                continue
+        best: Optional[Dict[str, Any]] = None
+        for raw, block, spatial, same_block in candidates:
+            normalized, valid = self._normalize(raw, field_type)
             if not normalized:
                 continue
-            confidence = (
-                block["confidence"] * 0.5
-                + spatial * 0.25
-                + (1.0 if valid else 0.25) * 0.25
-            )
+            if not valid and field_type in STRICT_TYPES:
+                continue
+            if not valid and field_type == "name":
+                continue
+            # Spatial proximity dominates: handwriting has low OCR confidence,
+            # so weighting OCR confidence highly favours printed boilerplate.
+            confidence = block["confidence"] * 0.15 + valid * 0.3 + spatial * 0.55
             if same_block:
-                confidence += 0.03
+                confidence += 0.05
             confidence = round(min(confidence, 1.0), 4)
             if best is None or confidence > best["confidence"]:
                 best = self._field(normalized, raw, block, confidence, not valid)
+                best["_block"] = block
+                best["_same_block"] = same_block
+
+        if best and not best["_same_block"] and field_type in ("name", "address"):
+            self._extend_row(best, blocks, label_block_ids, field_type)
+        if best and field_type == "address":
+            self._extend_address(best, blocks, schema_labels, label_block_ids)
         if best:
+            best.pop("_block", None)
+            best.pop("_same_block", None)
             return best
         return self._field(None, None, None, 0.0, bool(spec.get("required")), missing=True)
+
+    @staticmethod
+    def _another_label_owns_value(
+        blocks: List[Dict[str, Any]],
+        label_block: Dict[str, Any],
+        value_block: Dict[str, Any],
+        label_block_ids: Set[int],
+        same_row: bool,
+    ) -> bool:
+        """A value belongs to the closest label: skip the pair when a different
+        label block sits between this label and the value."""
+        label_box = label_block["bounding_box"]
+        value_box = value_block["bounding_box"]
+        for other in blocks:
+            if other is label_block or other is value_block:
+                continue
+            if id(other) not in label_block_ids or other["page"] != value_block["page"]:
+                continue
+            other_box = other["bounding_box"]
+            other_cy = other_box["y"] + other_box["height"] / 2
+            if same_row:
+                value_cy = value_box["y"] + value_box["height"] / 2
+                row_tolerance = max(value_box["height"], other_box["height"]) * 1.2
+                if abs(other_cy - value_cy) > row_tolerance:
+                    continue
+                if label_box["x"] + label_box["width"] <= other_box["x"] <= value_box["x"]:
+                    return True
+            else:
+                # A different label sitting to the left on the value's own row
+                # owns that row ("City | MANALI" must not feed proposer_name).
+                value_cy = value_box["y"] + value_box["height"] / 2
+                row_tolerance = max(value_box["height"], other_box["height"]) * 0.9
+                if abs(other_cy - value_cy) <= row_tolerance and other_box["x"] < value_box["x"]:
+                    return True
+                x_overlap = (
+                    min(value_box["x"] + value_box["width"], other_box["x"] + other_box["width"])
+                    - max(value_box["x"], other_box["x"])
+                )
+                if x_overlap <= 0:
+                    continue
+                # Another label above the value (and at or below this label's
+                # top) is the closer owner of that value column.
+                if label_box["y"] <= other_cy <= value_box["y"]:
+                    return True
+        return False
+
+    def _extend_row(
+        self,
+        field: Dict[str, Any],
+        blocks: List[Dict[str, Any]],
+        label_block_ids: Set[int],
+        field_type: str,
+    ) -> None:
+        """Handwritten values fragment into several blocks on one line
+        ("KAD" + "RA KAZIM MARUF"); join the row before normalizing."""
+        base = field.get("_block")
+        if not base:
+            return
+        box, page = base["bounding_box"], base["page"]
+        base_cy = box["y"] + box["height"] / 2
+        right_edge = box["x"] + box["width"]
+        parts = [base["text"].strip()]
+        followers = sorted(
+            (b for b in blocks if b is not base and b["page"] == page),
+            key=lambda b: b["bounding_box"]["x"],
+        )
+        for block in followers:
+            b = block["bounding_box"]
+            block_cy = b["y"] + b["height"] / 2
+            if abs(block_cy - base_cy) > max(box["height"], b["height"]) * 0.6:
+                continue
+            gap = b["x"] - right_edge
+            if gap < -10 or gap > max(50.0, box["height"] * 2.5):
+                continue
+            text = block["text"].strip()
+            if not text or id(block) in label_block_ids or VALUE_NOISE_RE.search(text):
+                break
+            words = re.findall(r"[a-z]{2,}", text.lower())
+            if words and all(word in NAME_STOPWORDS for word in words):
+                break
+            parts.append(text)
+            right_edge = b["x"] + b["width"]
+        merged = " ".join(parts)
+        if merged == parts[0]:
+            return
+        normalized, valid = self._normalize(merged, field_type)
+        if normalized and valid:
+            field["value"] = normalized
+            field["normalized_value"] = normalized
+            field["raw_text"] = merged
+
+    def _extend_address(
+        self,
+        field: Dict[str, Any],
+        blocks: List[Dict[str, Any]],
+        schema_labels: List[str],
+        label_block_ids: Set[int],
+    ) -> None:
+        """Addresses span several OCR lines; append lines stacked directly below."""
+        base = field.get("_block")
+        if not base:
+            return
+        box, page = base["bounding_box"], base["page"]
+        parts = [field["value"]]
+        current_bottom = box["y"] + box["height"]
+        followers = sorted(
+            (b for b in blocks if b is not base and b["page"] == page),
+            key=lambda b: b["bounding_box"]["y"],
+        )
+        label_blocks = [b for b in blocks if id(b) in label_block_ids and b["page"] == page]
+        added = 0
+        for block in followers:
+            b = block["bounding_box"]
+            gap = b["y"] - current_bottom
+            x_overlap = min(box["x"] + box["width"], b["x"] + b["width"]) - max(box["x"], b["x"])
+            if gap < -5 or gap > max(b["height"], box["height"]) * 1.2 or x_overlap <= 0:
+                continue
+            text = block["text"].strip()
+            if not text or id(block) in label_block_ids:
+                break
+            if any(self._label_pattern(label).search(text.lower()) for label in schema_labels):
+                break
+            # A label to the left on the same row means this line is another
+            # field's value, not an address continuation.
+            block_cy = b["y"] + b["height"] / 2
+            if any(
+                lb["bounding_box"]["x"] < b["x"]
+                and abs(lb["bounding_box"]["y"] + lb["bounding_box"]["height"] / 2 - block_cy)
+                <= max(lb["bounding_box"]["height"], b["height"]) * 0.9
+                for lb in label_blocks
+            ):
+                break
+            parts.append(text)
+            current_bottom = b["y"] + b["height"]
+            added += 1
+            if added >= 5:
+                break
+        joined = re.sub(r"\s+", " ", " ".join(parts)).strip()
+        field["value"] = joined
+        field["normalized_value"] = joined
 
     def _filter_noise_blocks(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Remove empty, near-zero-confidence, and known pen-label blocks."""
@@ -293,7 +635,7 @@ class ExtractionService:
             cleaned.append(b)
         return cleaned
 
-    def _assemble_free_text(self, blocks: List[Dict[str, Any]]) -> List[str]:
+    def _assemble_free_text(self, blocks: List[Dict[str, Any]], trim_closing: bool = False) -> List[str]:
         """Sort OCR blocks spatially, group into lines then paragraphs, trim trailing noise."""
         valid = [b for b in blocks if b["text"].strip()]
         if not valid:
@@ -321,16 +663,18 @@ class ExtractionService:
         if current_line:
             lines.append(sorted(current_line, key=lambda b: b["bounding_box"]["x"]))
 
-        # Trim lines that appear after a letter closing phrase
-        _closing = re.compile(r"\b(sincere|regards|respect|truly|sincerely|yours|warm|cheers)\b", re.I)
-        trim_at = len(lines)
-        for i, line in enumerate(lines):
-            line_text = " ".join(b["text"] for b in line)
-            if _closing.search(line_text):
-                trim_at = i + 1
-                break
-        if trim_at < len(lines):
-            lines = lines[:trim_at]
+        # Trim lines after a letter closing phrase, but only for letter-like
+        # free text: forms legitimately contain words such as "respect".
+        if trim_closing:
+            _closing = re.compile(r"\b(sincere|regards|respect|truly|sincerely|yours|warm|cheers)\b", re.I)
+            trim_at = len(lines)
+            for i, line in enumerate(lines):
+                line_text = " ".join(b["text"] for b in line)
+                if _closing.search(line_text):
+                    trim_at = i + 1
+                    break
+            if trim_at < len(lines):
+                lines = lines[:trim_at]
 
         # Group lines into paragraphs by vertical gap
         paragraphs: List[List[List[Dict[str, Any]]]] = []
@@ -428,50 +772,126 @@ class ExtractionService:
                 )
         return fields
 
-    def _normalize(self, value: str, field_type: str) -> Tuple[Optional[str], bool]:
+    @staticmethod
+    def _collapse_boxed_letters(value: str) -> str:
+        """Comb/boxed fields OCR as spaced single characters; join them."""
+        tokens = value.split()
+        if len(tokens) >= 3 and sum(1 for t in tokens if len(t) == 1) / len(tokens) >= 0.6:
+            return "".join(tokens)
+        return value
 
+    def _normalize_email(self, value: str) -> Tuple[Optional[str], bool]:
+        v = re.sub(r"\s*@\s*", "@", value.strip())
+        if "@" not in v:
+            v = re.sub(
+                r"\s+(" + "|".join(KNOWN_EMAIL_PROVIDERS) + r")", r"@\1", v, count=1, flags=re.I
+            )
+        # Boxed-letter local parts OCR with spaces ("R I YASHARMA@..."): join
+        # everything before the @.
+        v = re.sub(r"\s+(?=[^@\s]*(?:\s+[^@\s]+)*@)", "", v)
+        # Rejoin split provider domains ("@g mail.com", "@ya hoo.com").
+        v = re.sub(r"@g\s*mail\b", "@gmail", v, flags=re.I)
+        v = re.sub(r"@ya\s*hoo\b", "@yahoo", v, flags=re.I)
+        v = re.sub(r"@hot\s*mail\b", "@hotmail", v, flags=re.I)
+        v = re.sub(r"@(?:g|gmai|gamil|qmail)\s*\.\s*com\b", "@gmail.com", v, flags=re.I)
+        v = re.sub(r"(@[A-Za-z0-9-]+)\s*\.\s*([A-Za-z]{2,6}\b)", r"\1.\2", v)
+        match = re.search(r"([A-Za-z0-9._%+-]+)@([A-Za-z0-9-]+)", v)
+        if not match:
+            return (re.sub(r"\s+", " ", value).strip() or None), False
+        local, domain = match.group(1), match.group(2)
+        rest = v[match.end():]
+        tld_at_domain = re.match(r"\.([A-Za-z]{2,6}(?:\.[A-Za-z]{2})?)", rest)
+        if tld_at_domain:
+            domain = f"{domain}.{tld_at_domain.group(1)}"
+        else:
+            # OCR often splits ".com" away from the domain; look ahead for it.
+            tld_nearby = TLD_RE.search(rest[:30])
+            if tld_nearby:
+                domain = f"{domain}.{tld_nearby.group(1)}"
+            elif domain.lower() in KNOWN_EMAIL_PROVIDERS:
+                domain = f"{domain}.com"
+        email = f"{local}@{domain}".lower().strip(".")
+        return email, bool(EMAIL_RE.match(email))
+
+    def _normalize_name(self, value: str) -> Tuple[Optional[str], bool]:
+        v = self._collapse_boxed_letters(value.strip(" .,:;*_-"))
+        v = re.sub(r"\s+", " ", v)
+        # Digit/letter confusions inside otherwise alphabetic words (R1YA).
+        v = re.sub(r"(?<=[A-Za-z])[01]|[01](?=[A-Za-z])", lambda m: {"0": "O", "1": "I"}[m.group(0)], v)
+        if not v:
+            return None, False
+        tokens = [t.strip(".,*:").lower() for t in v.split()]
+        if not 1 <= len(tokens) <= 5 or len(v) > 60:
+            return v, False
+        if any(t in NAME_STOPWORDS for t in tokens):
+            return v, False
+        alpha = sum(c.isalpha() for c in v)
+        if alpha < 2 or alpha / max(len(v.replace(" ", "")), 1) < 0.8:
+            return v, False
+        return v, True
+
+    def _normalize(self, value: str, field_type: str) -> Tuple[Optional[str], bool]:
         if field_type == "email":
-            value = value.replace(" @ ", "@")
-            value = value.replace(" gmail ", "@gmail.")
-            value = value.replace(" com", ".com")
-        value = re.sub(r"\s+", " ", value).strip(" :;,_")
-        value = re.split(
-            r"\b(?:Enclosure Check List|Discharge Date|First prescription|Copy of proposer|Aadhar Card No)\b",
-            value,
-            maxsplit=1,
-            flags=re.I,
-        )[0].strip(" ,:;")
-        patterns = {
-            "email": r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$",
-            "phone": r"^\+?[\d ()-]{8,18}$",
-            "pan": r"^[A-Z]{5,6}[0-9]{4}[A-Z]$",
-            "pin": r"^\d{6}$",
-            "date": r"^(?:\d{1,2}[/.-]){2}\d{2,4}$",
-            "currency": r"^(?:Rs\.?|₹|\$)?\s*[\d,]+(?:\.\d{1,2})?$",
-            "identifier": r"^[A-Za-z0-9/_-]{3,}$",
-        }
-        if field_type in patterns:
-            pattern = patterns[field_type]
-            search_pattern = pattern[1:-1] if pattern.startswith("^") and pattern.endswith("$") else pattern
-            match = re.search(search_pattern, value, re.I)
-            if match:
-                value = match.group(0).strip()
-        if field_type == "email":
-            value = value.replace(" @ ", "@")
-            value = value.replace("@ ", "@")
-            value = value.replace(" @", "@")
-            if "@gmail" in value and ".com" not in value:
-                value += ".com"
-            value = value.lower()
-        if field_type == "phone":
-            value = (value.replace("%", "9").replace("O", "0").replace("o", "0"))
-            value = re.sub(r"\D", "", value)
-        if field_type == "pin":
-            value = re.sub(r"\D", "", value)[:6]
+            return self._normalize_email(value)
         if field_type == "name":
-            value = value.strip(" .,:;")
-        valid = bool(re.match(patterns[field_type], value, re.I)) if field_type in patterns else len(value) >= 2
-        return value or None, valid
+            return self._normalize_name(value)
+
+        # Addresses keep their commas: they separate the address lines.
+        value = re.sub(r"\s+", " ", value).strip(" :;_" if field_type == "address" else " :;,_")
+        if not value:
+            return None, False
+
+        if field_type == "phone":
+            digits = re.sub(r"\D", "", value.replace("O", "0").replace("o", "0"))
+            if digits.startswith("91") and len(digits) == 12:
+                digits = digits[2:]
+            if digits.startswith("0") and len(digits) == 11:
+                digits = digits[1:]
+            return (digits or None), len(digits) == 10
+
+        if field_type == "pin":
+            digits = re.sub(r"\D", "", value)
+            return (digits[:6] or None), len(digits) == 6
+
+        if field_type == "pan":
+            compact = re.sub(r"[^A-Za-z0-9]", "", self._collapse_boxed_letters(value)).upper()
+            match = re.search(r"[A-Z]{5,6}[0-9]{4}[A-Z]", compact)
+            if match:
+                return match.group(0), True
+            return (compact or None), False
+
+        if field_type == "date":
+            compact = self._collapse_boxed_letters(value)
+            match = re.search(r"\b(\d{1,2})\s*[/.\-]\s*(\d{1,2})\s*[/.\-]\s*(\d{2,4})\b", compact)
+            if match:
+                return "/".join(match.groups()), True
+            digits = re.sub(r"\D", "", compact)
+            if len(digits) == 8:
+                return f"{digits[:2]}/{digits[2:4]}/{digits[4:]}", True
+            return value, False
+
+        if field_type == "currency":
+            match = re.search(r"(?:Rs\.?|₹|\$)?\s*\d[\d,]*(?:\.\d{1,2})?", value)
+            if match and sum(c.isdigit() for c in match.group(0)) >= 2:
+                return match.group(0).strip(), True
+            return value, False
+
+        if field_type == "identifier":
+            compact = re.sub(r"\s+", "", self._collapse_boxed_letters(value)).upper()
+            valid = bool(re.fullmatch(r"[A-Z0-9/\-]{4,25}", compact)) and sum(c.isdigit() for c in compact) >= 2
+            return (compact or None), valid
+
+        if field_type == "address":
+            boilerplate = re.search(
+                r"(?i)\b(same as above|please|tick|if any|if available|must not exceed|percentage)\b", value
+            )
+            valid = 4 <= len(value) <= 120 and not boilerplate
+            return value, valid
+
+        # plain string fields: reject prose paragraphs
+        value = self._collapse_boxed_letters(value)
+        valid = 2 <= len(value) <= 60 and len(value.split()) <= 6
+        return value, valid
 
     def _field(self, value, raw, block, confidence: float, invalid: bool, missing: bool = False) -> Dict[str, Any]:
         review = invalid or (not missing and confidence < self.settings.review_confidence)

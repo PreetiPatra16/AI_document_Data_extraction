@@ -69,7 +69,7 @@ class ExtractionWorker:
             for index, page in enumerate(pages):
                 page_blocks = await self.ocr.perform_ocr_multi_variant(page["variants"], page["page"])
                 if self.ocr.trocr:
-                    page_blocks = self._upgrade_low_confidence(page_blocks, page["variants"].get("original", ""))
+                    page_blocks = self._upgrade_low_confidence(page_blocks, page["variants"].get("denoised", ""))
                 blocks.extend(page_blocks)
                 progress = 30 + int(((index + 1) / len(pages)) * 40)
                 self.storage.update_job_progress(
@@ -134,25 +134,57 @@ class ExtractionWorker:
         self._cleanup(job["document_id"])
         self.storage.fail_job(job["id"], code, message, int((time.monotonic() - start) * 1000))
 
-    def _upgrade_low_confidence(self, blocks, original_image_path: str):
-        """Re-run TrOCR on blocks with low OCR confidence and replace text when the result is non-empty."""
-        if not original_image_path:
+    def _upgrade_low_confidence(self, blocks, aligned_image_path: str):
+        """Re-run TrOCR on plausible handwriting lines with low OCR confidence.
+
+        The crop source must be the deskewed/oriented variant the bounding boxes
+        were detected on; cropping the raw upload misaligns rotated documents.
+        """
+        if not aligned_image_path:
             return blocks
         upgraded = []
         for block in blocks:
-            if block["confidence"] < 0.5 and block.get("text", "").strip():
+            original_text = block.get("text", "").strip()
+            if block["confidence"] < 0.5 and original_text and self._is_handwriting_candidate(block):
                 try:
-                    result = self.ocr.recognize_handwriting_region(original_image_path, block["bounding_box"])
-                    if result["text"]:
-                        block = {**block, "text": result["text"], "source_engine": "trocr", "confidence": result["confidence"]}
+                    result = self.ocr.recognize_handwriting_region(aligned_image_path, block["bounding_box"])
+                    if self._accept_handwriting_result(original_text, result["text"]):
                         logger.info(
-                            "TrOCR upgrade page={} original_engine={} new_text={}",
-                            block["page"], block.get("source_engine"), result["text"][:40],
+                            "TrOCR upgrade page={} original_engine={} original_text={} new_text={}",
+                            block["page"], block.get("source_engine"), original_text[:40], result["text"][:40],
                         )
+                        block = {
+                            **block,
+                            "text": result["text"],
+                            "source_engine": "trocr",
+                            "confidence": max(block["confidence"], result["confidence"]),
+                        }
                 except Exception:
                     pass
             upgraded.append(block)
         return upgraded
+
+    @staticmethod
+    def _is_handwriting_candidate(block) -> bool:
+        """TrOCR works on single text lines; skip regions that cannot be one."""
+        box = block["bounding_box"]
+        height, width = box["height"], box["width"]
+        if height < 12 or height > 160 or width < 24:
+            return False
+        return width / max(height, 1.0) >= 1.2
+
+    @staticmethod
+    def _accept_handwriting_result(original_text: str, new_text: str) -> bool:
+        """Reject TrOCR outputs that look like hallucinations rather than re-readings."""
+        new_text = new_text.strip()
+        if len(new_text) < 2 or not any(ch.isalnum() for ch in new_text):
+            return False
+        ratio = len(new_text) / max(len(original_text), 1)
+        if not 0.5 <= ratio <= 2.0:
+            return False
+        if any(ch.isdigit() for ch in original_text) != any(ch.isdigit() for ch in new_text):
+            return False
+        return True
 
     def _cleanup(self, document_id: str) -> None:
         self.ingestion.cleanup_document_files(document_id)

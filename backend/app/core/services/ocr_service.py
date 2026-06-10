@@ -160,16 +160,27 @@ class OCRService:
         return output
 
     async def perform_ocr_multi_variant(self, variants: Dict[str, str], page_num: int) -> List[Dict[str, Any]]:
-        """Run OCR on thresholded + denoised variants and merge, keeping the higher-confidence reading per region."""
+        """Run OCR on denoised + thresholded variants and merge, keeping the higher-confidence reading per region.
+
+        The thresholded pass is skipped when the denoised pass is already confident,
+        which roughly halves processing time on clean digital pages.
+        """
         all_blocks: List[Dict[str, Any]] = []
         last_error: Optional[Exception] = None
-        for variant_name in ("thresholded", "denoised"):
+        for variant_name in ("denoised", "thresholded"):
             path = variants.get(variant_name)
             if not path:
                 continue
             try:
                 blocks = await self.perform_ocr(path, page_num, variant=variant_name)
                 all_blocks.extend(blocks)
+                if variant_name == "denoised" and blocks:
+                    confidences = [b["confidence"] for b in blocks]
+                    if len(blocks) >= 5 and sum(confidences) / len(confidences) >= 0.9:
+                        logger.info(
+                            "OCR variant=thresholded skipped page={} reason=denoised_confident", page_num
+                        )
+                        break
             except OCRException as exc:
                 last_error = exc
                 logger.warning("OCR variant={} skipped page={} reason={}", variant_name, page_num, exc.message)
@@ -221,7 +232,7 @@ class OCRService:
         if not self.trocr:
             raise OCRException("Local TrOCR model is unavailable.", details={"engine": "trocr"})
         img = Image.open(image_path).convert("RGB")
-        pad = 4
+        pad = max(4, int(bounding_box["height"] * 0.15))
         x1 = max(0, int(bounding_box["x"]) - pad)
         y1 = max(0, int(bounding_box["y"]) - pad)
         x2 = min(img.width, int(bounding_box["x"] + bounding_box["width"]) + pad)
@@ -233,4 +244,4 @@ class OCRService:
         pixels = processor(images=cropped, return_tensors="pt").pixel_values.to(self.trocr_device)
         generated = model.generate(pixels)
         text = processor.batch_decode(generated, skip_special_tokens=True)[0]
-        return {"text": text.strip(), "confidence": 0.7, "source_engine": "trocr"}
+        return {"text": text.strip(), "confidence": 0.6, "source_engine": "trocr"}

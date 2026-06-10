@@ -77,6 +77,9 @@ class PreprocessingService:
 
             osd = pytesseract.image_to_osd(image, output_type=pytesseract.Output.DICT)
             rotation = int(osd.get("rotate", 0))
+            # OSD misfires on photographed forms; only rotate on a confident reading.
+            if float(osd.get("orientation_conf", 0.0)) < 2.5:
+                return image
             if rotation == 90:
                 return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
             if rotation == 180:

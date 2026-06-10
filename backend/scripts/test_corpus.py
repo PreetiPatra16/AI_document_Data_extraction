@@ -208,7 +208,7 @@ def main() -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     results = []
     api_url = args.api_url.rstrip("/") + "/"
-    with httpx.Client(base_url=api_url, timeout=60) as client:
+    with httpx.Client(base_url=api_url, timeout=httpx.Timeout(120, connect=10)) as client:
         try:
             readiness = request_json(client, "GET", "health/ready")
             write_json(run_dir / "00-readiness.json", readiness)

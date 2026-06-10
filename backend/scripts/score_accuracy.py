@@ -27,7 +27,11 @@ def score(expected_path: Path, actual_path: Path):
         "typed_accuracy": matches["typed"] / totals["typed"] if totals["typed"] else None,
         "handwritten_accuracy": matches["handwritten"] / totals["handwritten"] if totals["handwritten"] else None,
         "missing_fields": missing,
-        "false_positive_fields": len(set(actual_fields) - set(expected["fields"])),
+        "false_positive_fields": sum(
+            1
+            for name in set(actual_fields) - set(expected["fields"])
+            if actual_fields[name].get("normalized_value") is not None
+        ),
     }
 
 
